@@ -24,6 +24,16 @@ muhlya-headless*
 *.linux
 **/build/bin/
 
+# Accidental local Go binaries (no extension)
+/moex-trader-gui/app
+/moex-trader-gui/moex-trader-gui
+/moex-trader/moex-trader
+/moex-trader/moex-trader-desktop/moex-trader-desktop
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+
 # Local junk
 /4)
 
