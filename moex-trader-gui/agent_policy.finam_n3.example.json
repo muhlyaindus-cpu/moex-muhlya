@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "aggression": 0.85,
+  "min_confidence": 0.72,
+  "buy_budget_pct": 0.06,
+  "sell_budget_pct": 0.05,
+  "rsi_buy_below": 28,
+  "rsi_sell_above": 72,
+  "min_stock_notional_rub": 5000,
+  "notes": "Ориентир под Finam N3 Investor: акции MOEX, меньше сделок, выше порог RSI."
+}

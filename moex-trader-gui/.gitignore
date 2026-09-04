@@ -1,0 +1,4 @@
+build/bin
+node_modules
+frontend/dist
+finam_symbol_overrides.json

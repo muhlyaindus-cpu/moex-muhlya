@@ -1,0 +1,722 @@
+package services
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type MOEXClient struct {
+	httpClient *http.Client
+	baseURL    string
+	lotMu      sync.Mutex
+	lotCache   map[string]int
+}
+
+type Security struct {
+	Ticker      string  `json:"ticker"`
+	Name        string  `json:"name"`
+	Price       float64 `json:"price"`
+	NumTrades   int     `json:"num_trades,omitempty"`
+	TurnoverRub float64 `json:"turnover_rub,omitempty"`
+}
+
+func NewMOEXClient() *MOEXClient {
+	return &MOEXClient{
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		baseURL:    "https://iss.moex.com/iss",
+		lotCache:   make(map[string]int),
+	}
+}
+
+func normalizeTickerForMOEX(ticker string) string {
+	t := strings.ToUpper(strings.TrimSpace(ticker))
+	if t == "" {
+		return ""
+	}
+	if i := strings.Index(t, "@"); i > 0 {
+		t = t[:i]
+	}
+	if i := strings.Index(t, "_"); i > 0 {
+		t = t[:i]
+	}
+	return strings.TrimSpace(t)
+}
+
+// GetLotSize возвращает размер лота в штуках для инструмента.
+// Если не удалось определить, возвращает 1.
+func (c *MOEXClient) GetLotSize(ticker string) int {
+	ticker = normalizeTickerForMOEX(ticker)
+	if ticker == "" {
+		return 1
+	}
+
+	c.lotMu.Lock()
+	if lot, ok := c.lotCache[ticker]; ok && lot > 0 {
+		c.lotMu.Unlock()
+		return lot
+	}
+	c.lotMu.Unlock()
+
+	stockPath := fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s.json?iss.meta=off&securities.columns=BOARDID,LOTSIZE", c.baseURL, ticker)
+	if lot, err := c.getLotSizeFromPath(stockPath, "TQBR", "TQTF", "TQTD", "SMAL"); err == nil && lot > 0 {
+		c.lotMu.Lock()
+		c.lotCache[ticker] = lot
+		c.lotMu.Unlock()
+		return lot
+	}
+
+	futuresPath := fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&securities.columns=BOARDID,LOTSIZE", c.baseURL, ticker)
+	if lot, err := c.getLotSizeFromPath(futuresPath, "RFUD", "ROPD"); err == nil && lot > 0 {
+		c.lotMu.Lock()
+		c.lotCache[ticker] = lot
+		c.lotMu.Unlock()
+		return lot
+	}
+
+	// Не кэшируем fallback=1: временные сетевые/ISS сбои не должны "залипать"
+	// и ломать кратность количества на весь аптайм процесса.
+	return 1
+}
+
+func (c *MOEXClient) GetCurrentPrice(ticker string) (float64, error) {
+	// Сначала пробуем акции, затем фьючерсы.
+	price, err := c.getCurrentPriceFromPath(
+		fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s.json", c.baseURL, ticker),
+	)
+	if err == nil && price > 0 {
+		return price, nil
+	}
+	return c.getCurrentPriceFromPath(
+		fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json", c.baseURL, ticker),
+	)
+}
+
+func tradingStatusFromMarketdataBlock(marketdata map[string]interface{}) (string, error) {
+	colsAny, ok := marketdata["columns"].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("marketdata.columns not found")
+	}
+	dataAny, ok := marketdata["data"].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("marketdata.data not found")
+	}
+	if len(dataAny) == 0 {
+		return "", fmt.Errorf("no marketdata rows")
+	}
+
+	tradingStatusIdx := findColumnIndex(colsAny, "TRADINGSTATUS")
+	if tradingStatusIdx < 0 {
+		return "", fmt.Errorf("TRADINGSTATUS column not found")
+	}
+
+	boardIdx := findColumnIndex(colsAny, "BOARDID")
+	rowOrder := make([]int, 0, len(dataAny))
+	if boardIdx >= 0 {
+		for i, rowAny := range dataAny {
+			row, ok := rowAny.([]interface{})
+			if !ok || boardIdx >= len(row) {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(moexToString(row[boardIdx])), "RFUD") {
+				rowOrder = append(rowOrder, i)
+				break
+			}
+		}
+	}
+	for i := range dataAny {
+		if len(rowOrder) > 0 && i == rowOrder[0] {
+			continue
+		}
+		rowOrder = append(rowOrder, i)
+	}
+
+	for _, idx := range rowOrder {
+		rowAny := dataAny[idx]
+		row, ok := rowAny.([]interface{})
+		if !ok {
+			continue
+		}
+		if tradingStatusIdx >= len(row) {
+			continue
+		}
+		status := strings.TrimSpace(moexToString(row[tradingStatusIdx]))
+		if status != "" {
+			return status, nil
+		}
+	}
+	return "", fmt.Errorf("empty TRADINGSTATUS")
+}
+
+// fortsRelaxedTradingStatus — для части FORTS (в т.ч. USDRUBF) ISS не отдаёт TRADINGSTATUS в marketdata,
+// но есть TRADEDATE и метки времени котировки: по ним оцениваем «идёт ли сессия» (грубо, по дате МСК).
+func fortsRelaxedTradingStatus(marketdata map[string]interface{}) (string, error) {
+	colsAny, ok := marketdata["columns"].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("marketdata.columns not found")
+	}
+	dataAny, ok := marketdata["data"].([]interface{})
+	if !ok || len(dataAny) == 0 {
+		return "", fmt.Errorf("no marketdata rows")
+	}
+
+	rowAny := dataAny[0]
+	row, ok := rowAny.([]interface{})
+	if !ok {
+		return "", fmt.Errorf("unexpected marketdata row format")
+	}
+
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		loc = time.UTC
+	}
+	today := time.Now().In(loc).Format("2006-01-02")
+
+	d := fortsTradingDateFromRow(colsAny, row)
+	if len(d) >= 10 {
+		d = d[:10]
+	}
+	if d == "" {
+		return "", fmt.Errorf("no TRADEDATE/TRADE_SESSION_DATE in relaxed mode")
+	}
+	if d != today {
+		return "N", nil
+	}
+
+	sysIdx := findColumnIndex(colsAny, "SYSTIME")
+	updIdx := findColumnIndex(colsAny, "UPDATETIME")
+	timeIdx := findColumnIndex(colsAny, "TIME")
+	active := false
+	if sysIdx >= 0 && sysIdx < len(row) && strings.TrimSpace(moexToString(row[sysIdx])) != "" {
+		active = true
+	}
+	if !active && updIdx >= 0 && updIdx < len(row) && strings.TrimSpace(moexToString(row[updIdx])) != "" {
+		active = true
+	}
+	if !active && timeIdx >= 0 && timeIdx < len(row) && strings.TrimSpace(moexToString(row[timeIdx])) != "" {
+		active = true
+	}
+	if !active {
+		return "", fmt.Errorf("relaxed: no time fields")
+	}
+	return "T", nil
+}
+
+func fortsTradingDateFromRow(colsAny []interface{}, row []interface{}) string {
+	for _, name := range []string{"TRADEDATE", "TRADE_SESSION_DATE"} {
+		idx := findColumnIndex(colsAny, name)
+		if idx < 0 || idx >= len(row) {
+			continue
+		}
+		s := strings.TrimSpace(moexToString(row[idx]))
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func (c *MOEXClient) fetchTradingStatusFromURL(u string) (string, error) {
+	resp, err := c.httpClient.Get(u)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	marketdata, ok := result["marketdata"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("marketdata block not found")
+	}
+	return tradingStatusFromMarketdataBlock(marketdata)
+}
+
+func (c *MOEXClient) fetchFortsTradingStatusFromURL(u string) (string, error) {
+	resp, err := c.httpClient.Get(u)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	marketdata, ok := result["marketdata"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("marketdata block not found")
+	}
+	if s, err := tradingStatusFromMarketdataBlock(marketdata); err == nil {
+		return s, nil
+	}
+	return fortsRelaxedTradingStatus(marketdata)
+}
+
+// GetTradingStatus получает TRADINGSTATUS для инструмента на акционном рынке.
+// Используется как "аварийный стоп" для выходных/праздников и закрытых сессий.
+func (c *MOEXClient) GetTradingStatus(ticker string) (string, error) {
+	ticker = strings.ToUpper(strings.TrimSpace(ticker))
+	if ticker == "" {
+		return "", fmt.Errorf("empty ticker")
+	}
+
+	// Для акций берем статус с основной доски TQBR.
+	// Иначе ISS может вернуть первый попавшийся board (например SPEQ) со статусом N,
+	// что ложно закрывает рынок при активной сессии.
+	tqbrURL := fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json?iss.meta=off&iss.only=marketdata",
+		c.baseURL, url.PathEscape(ticker))
+	if status, err := c.fetchTradingStatusFromURL(tqbrURL); err == nil {
+		return status, nil
+	}
+
+	// Fallback на старый путь без board, если по TQBR нет данных.
+	u := fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s.json?iss.meta=off&iss.only=marketdata",
+		c.baseURL, url.PathEscape(ticker))
+	return c.fetchTradingStatusFromURL(u)
+}
+
+// GetFortsTradingStatus — TRADINGSTATUS по срочному рынку (FORTS) для SECID MOEX (например SI-3.25, USDRUBF).
+// Для инструментов без колонки TRADINGSTATUS (часто USDRUBF) используется дополнительная эвристика по TRADEDATE/времени.
+func (c *MOEXClient) GetFortsTradingStatus(secid string) (string, error) {
+	secid = strings.TrimSpace(secid)
+	if secid == "" {
+		return "", fmt.Errorf("empty secid")
+	}
+	u := fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&iss.only=marketdata",
+		c.baseURL, url.PathEscape(secid))
+	return c.fetchFortsTradingStatusFromURL(u)
+}
+
+// GetClosePrices возвращает последние N цен закрытия (shares candles, дневные).
+func (c *MOEXClient) GetClosePrices(ticker string, days int) ([]float64, error) {
+	return c.GetClosePricesByInterval(ticker, days, 24)
+}
+
+// GetClosePricesByInterval возвращает последние N цен закрытия по interval MOEX ISS.
+// Частые интервалы: 1 (1m), 10 (10m), 60 (1h), 24 (1d), 7 (1w), 31 (1M), 4 (1Q).
+func (c *MOEXClient) GetClosePricesByInterval(ticker string, count int, interval int) ([]float64, error) {
+	if count <= 0 {
+		return []float64{}, nil
+	}
+	if interval <= 0 {
+		interval = 24
+	}
+
+	closes, err := c.getClosePricesFromPath(
+		fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s/candles.json", c.baseURL, ticker),
+		count,
+		interval,
+	)
+	if err == nil && len(closes) > 0 {
+		return closes, nil
+	}
+	// fallback для фьючерсов
+	return c.getClosePricesFromPath(
+		fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s/candles.json", c.baseURL, ticker),
+		count,
+		interval,
+	)
+}
+
+func (c *MOEXClient) GetWatchlist() []Security {
+	return c.GetStockInstruments("", 50)
+}
+
+func (c *MOEXClient) GetStockInstruments(query string, limit int) []Security {
+	return c.getMarketInstruments(
+		"/engines/stock/markets/shares/boards/TQBR/securities.json",
+		query,
+		limit,
+	)
+}
+
+func (c *MOEXClient) GetFuturesInstruments(query string, limit int) []Security {
+	return c.getMarketInstruments(
+		"/engines/futures/markets/forts/securities.json",
+		query,
+		limit,
+	)
+}
+
+func (c *MOEXClient) getCurrentPriceFromPath(path string) (float64, error) {
+	resp, err := c.httpClient.Get(path)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, err
+	}
+	return extractLastPrice(result)
+}
+
+func (c *MOEXClient) getMarketInstruments(endpoint, query string, limit int) []Security {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 300 {
+		limit = 300
+	}
+
+	u, _ := url.Parse(c.baseURL + endpoint)
+	q := u.Query()
+	q.Set("iss.meta", "off")
+	q.Set("securities.columns", "SECID,SHORTNAME")
+	q.Set("marketdata.columns", "SECID,LAST,NUMTRADES,VALTODAY")
+	u.RawQuery = q.Encode()
+
+	resp, err := c.httpClient.Get(u.String())
+	if err != nil {
+		return []Security{}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []Security{}
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return []Security{}
+	}
+
+	secBlock, _ := result["securities"].(map[string]interface{})
+	secCols, _ := secBlock["columns"].([]interface{})
+	secData, _ := secBlock["data"].([]interface{})
+	if len(secCols) == 0 || len(secData) == 0 {
+		return []Security{}
+	}
+
+	secidIdx := findColumnIndex(secCols, "SECID")
+	nameIdx := findColumnIndex(secCols, "SHORTNAME")
+	if secidIdx < 0 {
+		return []Security{}
+	}
+
+	prices := map[string]float64{}
+	marketBlock, _ := result["marketdata"].(map[string]interface{})
+	mCols, _ := marketBlock["columns"].([]interface{})
+	mData, _ := marketBlock["data"].([]interface{})
+	mdSecidIdx := findColumnIndex(mCols, "SECID")
+	mdLastIdx := findColumnIndex(mCols, "LAST")
+	mdNumTradesIdx := findColumnIndex(mCols, "NUMTRADES")
+	mdTurnoverIdx := findColumnIndex(mCols, "VALTODAY")
+	numTrades := map[string]int{}
+	turnovers := map[string]float64{}
+	if mdSecidIdx >= 0 && mdLastIdx >= 0 {
+		for _, rowAny := range mData {
+			row, _ := rowAny.([]interface{})
+			if mdSecidIdx >= len(row) || mdLastIdx >= len(row) {
+				continue
+			}
+			secid := moexToString(row[mdSecidIdx])
+			if secid == "" {
+				continue
+			}
+			prices[secid] = moexToFloat(row[mdLastIdx])
+			if mdNumTradesIdx >= 0 && mdNumTradesIdx < len(row) {
+				numTrades[secid] = int(moexToFloat(row[mdNumTradesIdx]))
+			}
+			if mdTurnoverIdx >= 0 && mdTurnoverIdx < len(row) {
+				turnovers[secid] = moexToFloat(row[mdTurnoverIdx])
+			}
+		}
+	}
+
+	query = strings.ToUpper(strings.TrimSpace(query))
+	items := make([]Security, 0, limit)
+	for _, rowAny := range secData {
+		row, _ := rowAny.([]interface{})
+		if secidIdx >= len(row) {
+			continue
+		}
+		ticker := strings.TrimSpace(moexToString(row[secidIdx]))
+		if ticker == "" {
+			continue
+		}
+
+		name := ticker
+		if nameIdx >= 0 && nameIdx < len(row) {
+			n := strings.TrimSpace(moexToString(row[nameIdx]))
+			if n != "" {
+				name = n
+			}
+		}
+
+		if query != "" {
+			if !strings.Contains(strings.ToUpper(ticker), query) && !strings.Contains(strings.ToUpper(name), query) {
+				continue
+			}
+		}
+
+		items = append(items, Security{
+			Ticker:      ticker,
+			Name:        name,
+			Price:       prices[ticker],
+			NumTrades:   numTrades[ticker],
+			TurnoverRub: turnovers[ticker],
+		})
+		if len(items) >= limit {
+			break
+		}
+	}
+
+	return items
+}
+
+func (c *MOEXClient) getLotSizeFromPath(path string, preferredBoards ...string) (int, error) {
+	resp, err := c.httpClient.Get(path)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, err
+	}
+
+	secBlock, _ := result["securities"].(map[string]interface{})
+	cols, _ := secBlock["columns"].([]interface{})
+	data, _ := secBlock["data"].([]interface{})
+	if len(cols) == 0 || len(data) == 0 {
+		return 0, fmt.Errorf("no securities data")
+	}
+
+	lotIdx := findColumnIndex(cols, "LOTSIZE")
+	if lotIdx < 0 {
+		return 0, fmt.Errorf("lotsize not found")
+	}
+	boardIdx := findColumnIndex(cols, "BOARDID")
+
+	prefRank := make(map[string]int, len(preferredBoards))
+	for i, b := range preferredBoards {
+		prefRank[strings.ToUpper(strings.TrimSpace(b))] = i
+	}
+	bestLot := 0
+	bestRank := len(preferredBoards) + 1000
+	fallbackLot := 0
+
+	for _, rowAny := range data {
+		row, _ := rowAny.([]interface{})
+		if lotIdx >= len(row) {
+			continue
+		}
+		lot := int(moexToFloat(row[lotIdx]))
+		if lot <= 0 {
+			continue
+		}
+		if fallbackLot == 0 {
+			fallbackLot = lot
+		}
+
+		if boardIdx >= 0 && boardIdx < len(row) && len(prefRank) > 0 {
+			board := strings.ToUpper(strings.TrimSpace(moexToString(row[boardIdx])))
+			if rank, ok := prefRank[board]; ok {
+				if rank < bestRank {
+					bestRank = rank
+					bestLot = lot
+				}
+			}
+		}
+	}
+
+	if bestLot > 0 {
+		return bestLot, nil
+	}
+	if fallbackLot > 0 {
+		return fallbackLot, nil
+	}
+	return 0, fmt.Errorf("lotsize value not found")
+}
+
+func (c *MOEXClient) getClosePricesFromPath(path string, count int, interval int) ([]float64, error) {
+	// Берем диапазон с запасом (выходные/праздники), чтобы собрать нужное число свечей.
+	till := time.Now().UTC()
+	spanDays := count * 3
+	switch interval {
+	case 1:
+		spanDays = 3
+	case 10:
+		spanDays = 14
+	case 60:
+		spanDays = 45
+	case 24:
+		if spanDays < 14 {
+			spanDays = 14
+		}
+	case 7:
+		spanDays = 120
+		if spanDays < count*21 {
+			spanDays = count * 21
+		}
+	case 31:
+		spanDays = 365
+		if spanDays < count*93 {
+			spanDays = count * 93
+		}
+	case 4:
+		spanDays = 365 * 2
+		if spanDays < count*365 {
+			spanDays = count * 365
+		}
+	}
+	from := till.AddDate(0, 0, -spanDays)
+
+	u, _ := url.Parse(path)
+	q := u.Query()
+	q.Set("from", from.Format("2006-01-02"))
+	q.Set("till", till.Format("2006-01-02"))
+	q.Set("interval", strconv.Itoa(interval))
+	u.RawQuery = q.Encode()
+
+	resp, err := c.httpClient.Get(u.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	candles, _ := result["candles"].(map[string]interface{})
+	if candles == nil {
+		return nil, fmt.Errorf("candles not found")
+	}
+
+	cols, _ := candles["columns"].([]interface{})
+	data, _ := candles["data"].([]interface{})
+	if len(cols) == 0 || len(data) == 0 {
+		return nil, fmt.Errorf("no candles")
+	}
+
+	closeIdx := -1
+	for i, col := range cols {
+		if moexToString(col) == "close" || moexToString(col) == "CLOSE" {
+			closeIdx = i
+			break
+		}
+	}
+	if closeIdx < 0 {
+		return nil, fmt.Errorf("close column not found")
+	}
+
+	closes := make([]float64, 0, len(data))
+	for _, rowAny := range data {
+		row, _ := rowAny.([]interface{})
+		if closeIdx >= len(row) {
+			continue
+		}
+		switch v := row[closeIdx].(type) {
+		case float64:
+			closes = append(closes, v)
+		case string:
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				closes = append(closes, f)
+			}
+		default:
+			_ = v
+		}
+	}
+
+	if len(closes) > count {
+		closes = closes[len(closes)-count:]
+	}
+	return closes, nil
+}
+
+func extractLastPrice(result map[string]interface{}) (float64, error) {
+	if marketdata, ok := result["marketdata"].(map[string]interface{}); ok {
+		if data, ok := marketdata["data"].([]interface{}); ok && len(data) > 0 {
+			if row, ok := data[0].([]interface{}); ok {
+				if columns, ok := marketdata["columns"].([]interface{}); ok {
+					for i, col := range columns {
+						if moexToString(col) == "LAST" && i < len(row) {
+							price := moexToFloat(row[i])
+							if price > 0 {
+								return price, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0, fmt.Errorf("last price not found")
+}
+
+func findColumnIndex(columns []interface{}, name string) int {
+	for i, col := range columns {
+		if moexToString(col) == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func moexToString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func moexToFloat(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case string:
+		f, err := strconv.ParseFloat(t, 64)
+		if err == nil {
+			return f
+		}
+	}
+	return 0
+}

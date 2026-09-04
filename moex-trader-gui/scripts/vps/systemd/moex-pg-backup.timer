@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily MOEX PostgreSQL backup
+
+[Timer]
+# Ежедневно в 03:30 по локальному времени сервера (на VPS задайте: timedatectl set-timezone Europe/Moscow)
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

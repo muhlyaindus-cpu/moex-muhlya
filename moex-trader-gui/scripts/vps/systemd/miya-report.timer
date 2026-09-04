@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Miya report cadence
+
+[Timer]
+# Срабатываем каждые 30 минут; сам скрипт внутри решает,
+# писать отчёт сейчас или пропустить по throttle (1ч/2ч).
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

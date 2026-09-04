@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Miya online candle monitor every minute
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

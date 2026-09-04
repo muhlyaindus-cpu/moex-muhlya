@@ -1,0 +1,21 @@
+[Unit]
+Description=MOEX trading PostgreSQL backup (pg_dump via Docker)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=traderbot
+Group=traderbot
+# Доступ к сокету Docker без sudo (пользователь должен быть в группе docker на хосте).
+SupplementaryGroups=docker
+
+# Каталог бэкапов и срок хранения (при необходимости скорректируйте под сервер).
+Environment=PG_BACKUP_DIR=/var/backups/moex-trading-pg
+Environment=PG_BACKUP_RETENTION_DAYS=14
+
+# Путь к репозиторию на VPS (при другом пути поправьте WorkingDirectory и ExecStart).
+WorkingDirectory=/opt/trading/app/moex-trader-gui
+ExecStart=/opt/trading/app/moex-trader-gui/scripts/vps/pg-backup.sh
+
+# Логи: journalctl -u moex-pg-backup.service

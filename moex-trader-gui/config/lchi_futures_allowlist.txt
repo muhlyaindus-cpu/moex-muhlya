@@ -1,0 +1,10 @@
+# Optional futures allowlist for Muhlya.
+# One futures ticker per line, without @FUT suffix.
+# Example:
+# SiM6
+# MXM6
+# SRM6
+#
+# If AGENT_FUTURES_ALLOWLIST_PATH is not set in .env,
+# futures universe remains unrestricted.
+GZM6

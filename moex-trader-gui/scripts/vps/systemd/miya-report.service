@@ -1,0 +1,30 @@
+[Unit]
+Description=Miya intraday report generator
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=traderbot
+Group=traderbot
+SupplementaryGroups=docker
+
+# При необходимости переопределите в drop-in:
+#   ONLINE_MIA_REPORTS_DIR
+#   ONLINE_MIA_ACTIVE_EVERY_MIN
+#   ONLINE_MIA_OFFHOURS_EVERY_MIN
+#   ONLINE_MIA_REPORT_RETENTION_DAYS
+#   ONLINE_MIA_BROKER_SNAPSHOT_PATH / ONLINE_MIA_BROKER_SNAPSHOT_STALE_SEC
+Environment=ONLINE_MIA_REPORTS_DIR=/var/log/muhlya-reports
+Environment=ONLINE_MIA_BROKER_SNAPSHOT_PATH=/var/log/muhlya-reports/broker_positions_snapshot.json
+Environment=ONLINE_MIA_BROKER_SNAPSHOT_STALE_SEC=900
+Environment=ONLINE_MIA_ACTIVE_EVERY_MIN=60
+Environment=ONLINE_MIA_OFFHOURS_EVERY_MIN=120
+Environment=ONLINE_MIA_REPORT_RETENTION_DAYS=14
+Environment=ONLINE_MIA_TZ=Europe/Moscow
+
+WorkingDirectory=/opt/trading/app/moex-trader-gui
+ExecStart=/opt/trading/app/moex-trader-gui/scripts/vps/miya-report.sh
+
+# Логи:
+#   journalctl -u miya-report.service -n 50 --no-pager

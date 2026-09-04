@@ -1,0 +1,35 @@
+{
+  "updated_at": "2026-04-16T09:25:17Z",
+  "tickers": {
+    "MTSS": {
+      "ticker": "MTSS",
+      "samples": 1,
+      "wins": 0,
+      "losses": 1,
+      "sum_win_pct": 0,
+      "sum_loss_pct": -0.00244525953095475,
+      "last_reason": "stale_timeout",
+      "last_phase": "mid",
+      "last_pnl_pct": -0.00244525953095475,
+      "updated_at": "2026-04-16T09:25:17Z",
+      "tp_mul_learn": 1,
+      "tp_mul_hint": 1,
+      "tp_mul_final": 1
+    },
+    "NVTK": {
+      "ticker": "NVTK",
+      "samples": 1,
+      "wins": 1,
+      "losses": 0,
+      "sum_win_pct": 0.011082474226804202,
+      "sum_loss_pct": 0,
+      "last_reason": "tp",
+      "last_phase": "mid",
+      "last_pnl_pct": 0.011082474226804202,
+      "updated_at": "2026-04-18T08:52:37Z",
+      "tp_mul_learn": 1,
+      "tp_mul_hint": 1,
+      "tp_mul_final": 1
+    }
+  }
+}

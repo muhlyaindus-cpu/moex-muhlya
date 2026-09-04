@@ -1,0 +1,46 @@
+# Secrets / local env
+.env
+**/.env
+
+# Node
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Built headless / deploy artifacts (do not publish binaries)
+muhlya-headless
+muhlya-headless*
+**/muhlya-headless
+**/muhlya-headless*
+*.linux
+**/build/bin/
+
+# Local junk
+/4)
+
+# trading-lab: локальные артефакты валидации / смок-данные
+trading-lab/artifacts/validation.passed
+trading-lab/artifacts/validation_report.json
+trading-lab/data/_smoke_prices.csv
+trading-lab/artifacts/*.zip
+trading-lab/data/*.csv
+
+# Одноразовые диагностические SQL в корне (не коммитить снова)
+/tmp_*.sql
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+!.cursor/rules/

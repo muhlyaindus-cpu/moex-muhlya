@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "aggression": 1.0,
+  "min_confidence": 0.55,
+  "buy_budget_pct": 0.08,
+  "sell_budget_pct": 0.05,
+  "rsi_buy_below": 35,
+  "rsi_sell_above": 65,
+  "min_stock_notional_rub": 1000,
+  "notes": "smoke test policy"
+}
