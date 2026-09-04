@@ -6,11 +6,11 @@
 
 ## 2026-09-04
 
-### Публикация на GitHub (public `moex-muhlya`)
-- Репозиторий готовится как **public** для совместных улучшений; IP VPS в docs/логах заменён на плейсхолдер `YOUR_VPS_HOST`.
-- Расширен корневой `.gitignore` (бинари `muhlya-headless*`, `*.linux`, артефакты lab); удалён мусорный файл `4)`.
-- Установлен GitHub CLI (`winget` → `GitHub.cli`); `.env` с секретами **не** попадает в git.
-- `NEXT_STEPS.md`: оперативный фокус **2026-09-04** + архив **2026-04-24**.
+### Публикация на GitHub (public `moex-muhlya`) — push выполнен
+- Репозиторий: https://github.com/muhlyaindus-cpu/moex-muhlya (public, ветка `main`).
+- IP VPS в docs/логах → плейсхолдер `YOUR_VPS_HOST`; `.env` и бинарники `muhlya-headless*` / локальные Go-бинари **не** в git.
+- Расширен `.gitignore`; MIT `LICENSE`; обновлены README / `NEXT_STEPS` (фокус **2026-09-04**).
+- Push по SSH (`muhlyaindus-cpu`); для Git настроен локальный `core.sshCommand` на системный OpenSSH (кириллический профиль Windows).
 
 ## 2026-04-24
 
