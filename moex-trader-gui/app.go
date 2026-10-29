@@ -2816,8 +2816,14 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 		return
 	}
 
+	// Загружаем аналитику: RSI(14), SMA20, SMA50, тренд
+	a.moex.EnrichWithAnalytics(snapshot)
+
 	upCount := 0
 	totalCount := 0
+	trendBullCount := 0
+	rsiOversold := 0  // RSI < 30
+	rsiOverbought := 0 // RSI > 70
 	type liqEntry struct {
 		ticker   string
 		turnover float64
@@ -2833,6 +2839,16 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 		if item.Change > 0 {
 			upCount++
 		}
+		if item.TrendBull {
+			trendBullCount++
+		}
+		if item.RSI14 > 0 {
+			if item.RSI14 < 30 {
+				rsiOversold++
+			} else if item.RSI14 > 70 {
+				rsiOverbought++
+			}
+		}
 		liquidityData = append(liquidityData, liqEntry{item.Ticker, item.TurnoverRub})
 	}
 
@@ -2847,6 +2863,22 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	} else if upRatioPct <= 35 {
 		state = "bearish"
 	}
+
+	// Улучшенное определение state с учётом тренда
+	trendBullPct := 0.0
+	if totalCount > 0 {
+		trendBullPct = float64(trendBullCount) / float64(totalCount) * 100.0
+	}
+	// Если большинство тикеров в бычьем тренде, корректируем state
+	if trendBullPct >= 60 && state == "bearish" {
+		state = "neutral" // рынок разворачивается
+	} else if trendBullPct <= 20 && state == "bullish" {
+		state = "neutral" // рынок разворачивается
+	}
+
+	// Логируем расширенную аналитику Мии
+	a.addRuntimeEvent("info", "miya.analytics", fmt.Sprintf("tickers=%d up=%.1f%% trend_bull=%d rsi_oversold=%d rsi_overbought=%d state=%s",
+		totalCount, upRatioPct, trendBullCount, rsiOversold, rsiOverbought, state))
 
 	sort.Slice(liquidityData, func(i, j int) bool {
 		return liquidityData[i].turnover > liquidityData[j].turnover

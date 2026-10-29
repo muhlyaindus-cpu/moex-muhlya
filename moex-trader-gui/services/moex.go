@@ -238,7 +238,11 @@ type MarketSnapshotItem struct {
 	Last          float64
 	Change        float64
 	TurnoverRub   float64
-	TradingActive bool // true если торги идут (TRADINGSTATUS = "T" или 2)
+	TradingActive bool    // true если торги идут (TRADINGSTATUS = "T" или 2)
+	RSI14         float64 // RSI(14) — 0-100, <30 перепродан, >70 перекуплен
+	TrendBull     bool    // true если SMA20 > SMA50 (восходящий тренд)
+	SMA20         float64 // 20-дневная скользящая средняя
+	SMA50         float64 // 50-дневная скользящая средняя
 }
 
 // GetMarketSnapshot возвращает LAST, CHANGE, VALTODAY, TRADINGSTATUS для списка тикеров (акции TQBR).
@@ -312,6 +316,36 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 		}
 	}
 	return result
+}
+
+// EnrichWithAnalytics загружает свечи для каждого тикера и вычисляет RSI(14), SMA20, SMA50, тренд.
+// Модифицирует items inplace.
+func (c *MOEXClient) EnrichWithAnalytics(items []MarketSnapshotItem) {
+	for i := range items {
+		// Загружаем 55 дневных свечей (нужно 50 для SMA50 + запас)
+		closes, err := c.GetClosePrices(items[i].Ticker, 55)
+		if err != nil || len(closes) < 20 {
+			continue
+		}
+
+		// RSI(14)
+		if len(closes) >= 15 {
+			items[i].RSI14 = RSI(closes, 14)
+		}
+
+		// SMA20 и SMA50
+		if len(closes) >= 20 {
+			items[i].SMA20 = SMA(closes[len(closes)-20:])
+		}
+		if len(closes) >= 50 {
+			items[i].SMA50 = SMA(closes[len(closes)-50:])
+		}
+
+		// Trend: SMA20 > SMA50 = бычий тренд
+		if items[i].SMA20 > 0 && items[i].SMA50 > 0 {
+			items[i].TrendBull = items[i].SMA20 > items[i].SMA50
+		}
+	}
 }
 
 func tradingStatusFromMarketdataBlock(marketdata map[string]interface{}) (string, error) {
