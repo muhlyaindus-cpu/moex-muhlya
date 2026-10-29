@@ -6,6 +6,25 @@
 
 ## 2026-10-29
 
+### 🤖 Мия стала полноценным советчиком + Pending fix (2026-10-29 ~14:00 MSK)
+- **Мия с рекомендациями:** RSI(14), SMA20/50, тренд, score 0-100 для каждого тикера
+  - Топ-5: TATN(96,bull), NLMK(96,bull), TATNP(95,bull), SNGSP(91,bull), SBER(84,bull)
+  - Мухля получает бонус к rankScore: `AGENT_MIA_RECOMMENDATION_WEIGHT=0.25`
+- **Автоотмена pending ордеров:** `cancelStalePendingBuyOrders()` при старте — отменяет зависшие buy-заявки
+  - Результат: `auto.stale_pending_cleaned: cancelled=1` (DATA@MISX)
+  - Pending блокировки (`skip_buy_global_pending`) устранены
+- **Pending block уменьшен:** `AGENT_PENDING_GLOBAL_BLOCK_MAX_MIN=2` (было 45 мин)
+- **Мухля торгует:** AKPP buy 16 @ 113.96₽ — успешная покупка после разблокировки
+- **Баланс:** 28,637₽ (снизился из-за покупки AKPP)
+- **Позиции:** AKPP 135шт, AMGL 37шт, DATA 12шт
+- **AKMM/AKFB шорты:** отклоняются [157] Equities shortage — нужна квалификация
+
+### 📊 Мия аналитика (inline MIYA с TRADINGSTATUS fix):
+- `miya_state=neutral data_status=ok up_ratio=7.14 tickers=14`
+- `trend_bull=14 rsi_avg=57 rsi_oversold=0 rsi_overbought=1`
+- Все 14 тикеров в бычьем тренде (SMA20 > SMA50)
+- TRADINGSTATUS fix: MOEX ISS возвращает "T" (строка), а не 2 (число)
+
 ### 🚀 ДЕПЛОЙ НА VPS TIMEWEB ЗАВЕРШЁН (2026-10-29 12:51 MSK)
 - **VPS:** Timeweb Cloud, IP 72.56.13.248
 - **Мухля:** headless на VPS, systemd-сервис, Finam REAL (account 2044710)
