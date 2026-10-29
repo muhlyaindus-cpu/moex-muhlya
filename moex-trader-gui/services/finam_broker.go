@@ -72,6 +72,9 @@ type FinamBroker struct {
 	// Успешно подтверждённый GetAsset альтернативный символ (MOEX SECID ≠ тикер Finam в индексе).
 	futuresLearnedMu     sync.RWMutex
 	futuresSymbolLearned map[string]string
+	
+	// Ссылка на MOEXClient для доступа к кэшу SHORTNAME (маппинг тикеров фьючерсов)
+	moexClient *MOEXClient
 }
 
 type Account struct {
@@ -412,6 +415,20 @@ func NewFinamBroker(secretReal string) (*FinamBroker, error) {
 	}
 
 	return broker, nil
+}
+
+// SetMOEXClient устанавливает ссылку на MOEXClient для доступа к кэшу SHORTNAME (маппинг тикеров фьючерсов)
+func (b *FinamBroker) SetMOEXClient(moex *MOEXClient) {
+	b.moexClient = moex
+}
+
+// ReloadSymbolOverrides перечитывает файл overrides (вызывается после автообновления тикеров)
+func (b *FinamBroker) ReloadSymbolOverrides() {
+	newOverrides := LoadFinamSymbolOverridesFromEnv()
+	if newOverrides != nil {
+		b.symbolOverrides = newOverrides
+		log.Printf("📎 Перезагружено переопределений символов Finam: %d", len(newOverrides))
+	}
 }
 
 // refreshJWT получает новый JWT токен из API
@@ -879,21 +896,45 @@ func (b *FinamBroker) formatSymbolForREST(ticker string) string {
 		return ticker
 	}
 	if isLikelyFutureTicker(ticker) {
-		return ticker + "@FUT"
+		// Для фьючерсов Finam API использует формат TICKER@RTSX (например, MTZ6@RTSX)
+		// НЕ MTSI-12.26@FUT — это неправильный формат!
+		return ticker + "@RTSX"
 	}
 	return ticker + "@MISX"
 }
 
 func isLikelyFutureTicker(ticker string) bool {
-	// Для FORTS тикеров часто характерно наличие цифр (месяц/год контракта).
-	hasDigit := false
-	for _, r := range ticker {
-		if r >= '0' && r <= '9' {
-			hasDigit = true
-			break
+	// Фьючерсы MOEX имеют формат: 2-4 буквы + 1-2 цифры (месяц) + 1-2 цифры (год)
+	// Например: MTZ6, SiZ6, BRX6, GZM6
+	// Акции с цифрами: OZON, X5, YNDX — НЕ фьючерсы!
+	
+	// Если тикер содержит @ — это уже полный символ (например, MTZ6@RTSX)
+	if strings.Contains(ticker, "@") {
+		return strings.HasSuffix(strings.ToUpper(ticker), "@FUT") || 
+		       strings.HasSuffix(strings.ToUpper(ticker), "@RTSX")
+	}
+	
+	// Проверяем формат: 2-4 буквы + 2 цифры (месяц и год)
+	// Регулярное выражение: ^[A-Z]{2,4}[0-9]{2}$
+	if len(ticker) < 4 || len(ticker) > 6 {
+		return false
+	}
+	
+	// Последние 2 символа должны быть цифрами
+	lastTwo := ticker[len(ticker)-2:]
+	if lastTwo[0] < '0' || lastTwo[0] > '9' || lastTwo[1] < '0' || lastTwo[1] > '9' {
+		return false
+	}
+	
+	// Первые символы должны быть буквами
+	for i := 0; i < len(ticker)-2; i++ {
+		c := ticker[i]
+		if c < 'A' || c > 'Z' {
+			return false
 		}
 	}
-	return hasDigit
+	
+	return true
 }
 
 // GetAccounts возвращает список доступных счетов
@@ -1016,7 +1057,50 @@ func (b *FinamBroker) GetPortfolio(ctx context.Context) ([]Position, error) {
 	return positions, nil
 }
 
-// GetBalance возвращает баланс
+type AccountBalance struct {
+	Rub        float64  // Свободные рубли (фондовый рынок)
+	RubForts   float64  // Свободные рубли (срочный рынок)
+	Stocks     float64  // Стоимость акций
+	Futures    float64  // ГО фьючерсов
+	Total      float64  // Общий капитал
+}
+
+// GetDetailedBalance возвращает детальный баланс счёта
+func (b *FinamBroker) GetDetailedBalance(ctx context.Context) (AccountBalance, error) {
+	balance := AccountBalance{}
+	
+	accountID := b.GetCurrentAccount()
+	if accountID == "" {
+		return balance, errors.New("no current account selected")
+	}
+
+	if pb, err := b.getAccountGRPC(ctx); err == nil {
+		// Фондовый рынок — свободные рубли
+		if mc := pb.GetPortfolioMc(); mc != nil {
+			if mc.GetAvailableCash() != nil {
+				balance.Rub = protoDecimalToFloat(mc.GetAvailableCash())
+			}
+		}
+		
+		// Срочный рынок — свободные рубли для фьючерсов
+		if f := pb.GetPortfolioForts(); f != nil {
+			if f.GetAvailableCash() != nil {
+				balance.RubForts = protoDecimalToFloat(f.GetAvailableCash())
+			}
+		}
+		
+		// Общий капитал
+		if pb.GetEquity() != nil {
+			balance.Total = protoDecimalToFloat(pb.GetEquity())
+		}
+		
+		return balance, nil
+	}
+	
+	return balance, errors.New("failed to get balance from Finam API")
+}
+
+// GetBalance возвращает баланс (для обратной совместимости)
 func (b *FinamBroker) GetBalance(ctx context.Context) (float64, error) {
 	b.balanceMu.Lock()
 	if !b.balanceCachedAt.IsZero() && time.Since(b.balanceCachedAt) < b.balanceCacheTTL {
@@ -1440,8 +1524,17 @@ func (b *FinamBroker) placeOrder(ctx context.Context, ticker, side, orderType st
 		"comment":       fmt.Sprintf("moex-bot|%s|%d", strings.ToLower(side), time.Now().Unix()),
 	}
 	if orderType == "ORDER_TYPE_LIMIT" {
+		decimals := 2
+		if b.moexClient != nil {
+			d := b.moexClient.GetDecimals(ticker)
+			// Для акций Finam API требует минимум 2 знака после запятой
+			if !isLikelyFutureTicker(ticker) && d < 2 {
+				d = 2
+			}
+			decimals = d
+		}
 		bodyMap["limit_price"] = map[string]string{
-			"value": strconv.FormatFloat(limitPrice, 'f', -1, 64),
+			"value": strconv.FormatFloat(limitPrice, 'f', decimals, 64),
 		}
 	}
 

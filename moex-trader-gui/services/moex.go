@@ -17,21 +17,30 @@ type MOEXClient struct {
 	baseURL    string
 	lotMu      sync.Mutex
 	lotCache   map[string]int
+	// Кэш SHORTNAME для фьючерсов: SECID → SHORTNAME (например, "MTZ6" → "MTSI-12.26")
+	shortNameMu   sync.RWMutex
+	shortNameCache map[string]string
+	// Кэш DECIMALS (количество знаков после запятой в цене) для форматирования цены ордера
+	decimalsMu    sync.Mutex
+	decimalsCache map[string]int
 }
 
 type Security struct {
-	Ticker      string  `json:"ticker"`
-	Name        string  `json:"name"`
-	Price       float64 `json:"price"`
-	NumTrades   int     `json:"num_trades,omitempty"`
-	TurnoverRub float64 `json:"turnover_rub,omitempty"`
+	Ticker      string     `json:"ticker"`
+	Name        string     `json:"name"`
+	Price       float64    `json:"price"`
+	NumTrades   int        `json:"num_trades,omitempty"`
+	TurnoverRub float64    `json:"turnover_rub,omitempty"`
+	ExpiryDate  *time.Time `json:"expiry_date,omitempty"` // Дата экспирации для фьючерсов
 }
 
 func NewMOEXClient() *MOEXClient {
 	return &MOEXClient{
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		baseURL:    "https://iss.moex.com/iss",
-		lotCache:   make(map[string]int),
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		baseURL:        "https://iss.moex.com/iss",
+		lotCache:       make(map[string]int),
+		shortNameCache: make(map[string]string),
+		decimalsCache:  make(map[string]int),
 	}
 }
 
@@ -47,6 +56,23 @@ func normalizeTickerForMOEX(ticker string) string {
 		t = t[:i]
 	}
 	return strings.TrimSpace(t)
+}
+
+// SetShortNameCache сохраняет SHORTNAME для SECID (используется для маппинга тикеров фьючерсов)
+func (c *MOEXClient) SetShortNameCache(secid, shortName string) {
+	if secid == "" || shortName == "" {
+		return
+	}
+	c.shortNameMu.Lock()
+	c.shortNameCache[secid] = shortName
+	c.shortNameMu.Unlock()
+}
+
+// GetShortName возвращает SHORTNAME для SECID (например, "MTZ6" → "MTSI-12.26")
+func (c *MOEXClient) GetShortName(secid string) string {
+	c.shortNameMu.RLock()
+	defer c.shortNameMu.RUnlock()
+	return c.shortNameCache[secid]
 }
 
 // GetLotSize возвращает размер лота в штуках для инструмента.
@@ -85,6 +111,114 @@ func (c *MOEXClient) GetLotSize(ticker string) int {
 	return 1
 }
 
+// GetDecimals возвращает количество знаков после запятой в цене инструмента (DECIMALS из MOEX ISS).
+// Используется для правильного форматирования цены лимитного ордера.
+// Если не удалось определить, возвращает 2 (безопасный дефолт для большинства акций MOEX).
+func (c *MOEXClient) GetDecimals(ticker string) int {
+	ticker = normalizeTickerForMOEX(ticker)
+	if ticker == "" {
+		return 2
+	}
+
+	c.decimalsMu.Lock()
+	if d, ok := c.decimalsCache[ticker]; ok && d >= 0 {
+		c.decimalsMu.Unlock()
+		return d
+	}
+	c.decimalsMu.Unlock()
+
+	// Акции
+	stockPath := fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s.json?iss.meta=off&securities.columns=BOARDID,DECIMALS", c.baseURL, ticker)
+	if d, err := c.getDecimalsFromPath(stockPath, "TQBR", "TQTF", "TQTD", "SMAL"); err == nil && d >= 0 {
+		c.decimalsMu.Lock()
+		c.decimalsCache[ticker] = d
+		c.decimalsMu.Unlock()
+		return d
+	}
+
+	// Фьючерсы
+	futuresPath := fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&securities.columns=BOARDID,DECIMALS", c.baseURL, ticker)
+	if d, err := c.getDecimalsFromPath(futuresPath, "RFUD", "ROPD"); err == nil && d >= 0 {
+		c.decimalsMu.Lock()
+		c.decimalsCache[ticker] = d
+		c.decimalsMu.Unlock()
+		return d
+	}
+
+	return 2
+}
+
+// getDecimalsFromPath запрашивает DECIMALS из MOEX ISS для указанной доски.
+func (c *MOEXClient) getDecimalsFromPath(path string, primaryBoard string, altBoards ...string) (int, error) {
+	resp, err := c.httpClient.Get(path)
+	if err != nil {
+		return -1, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return -1, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return -1, err
+	}
+
+	secBlock, _ := result["securities"].(map[string]interface{})
+	colsAny, ok := secBlock["columns"].([]interface{})
+	if !ok {
+		return -1, fmt.Errorf("securities.columns not found")
+	}
+	dataAny, ok := secBlock["data"].([]interface{})
+	if !ok || len(dataAny) == 0 {
+		return -1, fmt.Errorf("securities.data not found")
+	}
+
+	boardIdx := findColumnIndex(colsAny, "BOARDID")
+	decimalsIdx := findColumnIndex(colsAny, "DECIMALS")
+	if decimalsIdx < 0 {
+		return -1, fmt.Errorf("DECIMALS column not found")
+	}
+
+	// Сначала ищем primaryBoard, затем altBoards
+	boards := append([]string{primaryBoard}, altBoards...)
+	for _, targetBoard := range boards {
+		for _, rowAny := range dataAny {
+			row, _ := rowAny.([]interface{})
+			if decimalsIdx >= len(row) {
+				continue
+			}
+			board := ""
+			if boardIdx >= 0 && boardIdx < len(row) {
+				board = moexToString(row[boardIdx])
+			}
+			if board != targetBoard {
+				continue
+			}
+			d := int(moexToFloat(row[decimalsIdx]))
+			if d >= 0 {
+				return d, nil
+			}
+		}
+	}
+
+	// Если ни одна доска не найдена, берём первое валидное значение
+	for _, rowAny := range dataAny {
+		row, _ := rowAny.([]interface{})
+		if decimalsIdx >= len(row) {
+			continue
+		}
+		d := int(moexToFloat(row[decimalsIdx]))
+		if d >= 0 {
+			return d, nil
+		}
+	}
+
+	return -1, fmt.Errorf("DECIMALS not found for any board")
+}
+
 func (c *MOEXClient) GetCurrentPrice(ticker string) (float64, error) {
 	// Сначала пробуем акции, затем фьючерсы.
 	price, err := c.getCurrentPriceFromPath(
@@ -96,6 +230,78 @@ func (c *MOEXClient) GetCurrentPrice(ticker string) (float64, error) {
 	return c.getCurrentPriceFromPath(
 		fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json", c.baseURL, ticker),
 	)
+}
+
+// MarketSnapshotItem — снимок рыночных данных для одного тикера (для inline MIYA).
+type MarketSnapshotItem struct {
+	Ticker        string
+	Last          float64
+	Change        float64
+	TurnoverRub   float64
+	TradingStatus int
+}
+
+// GetMarketSnapshot возвращает LAST, CHANGE, VALTODAY, TRADINGSTATUS для списка тикеров (акции TQBR).
+func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
+	result := make([]MarketSnapshotItem, 0, len(tickers))
+	for _, ticker := range tickers {
+		t := normalizeTickerForMOEX(ticker)
+		if t == "" {
+			continue
+		}
+		u := fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t)
+		resp, err := c.httpClient.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		var parsed map[string]interface{}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			continue
+		}
+		mdBlock, _ := parsed["marketdata"].(map[string]interface{})
+		if mdBlock == nil {
+			continue
+		}
+		cols, _ := mdBlock["columns"].([]interface{})
+		data, _ := mdBlock["data"].([]interface{})
+		if len(cols) == 0 || len(data) == 0 {
+			continue
+		}
+		lastIdx := findColumnIndex(cols, "LAST")
+		changeIdx := findColumnIndex(cols, "CHANGE")
+		valIdx := findColumnIndex(cols, "VALTODAY")
+		statusIdx := findColumnIndex(cols, "TRADINGSTATUS")
+		for _, rowAny := range data {
+			row, _ := rowAny.([]interface{})
+			if lastIdx >= len(row) {
+				continue
+			}
+			last := moexToFloat(row[lastIdx])
+			if last <= 0 {
+				continue
+			}
+			item := MarketSnapshotItem{
+				Ticker: t,
+				Last:   last,
+			}
+			if changeIdx >= 0 && changeIdx < len(row) {
+				item.Change = moexToFloat(row[changeIdx])
+			}
+			if valIdx >= 0 && valIdx < len(row) {
+				item.TurnoverRub = moexToFloat(row[valIdx])
+			}
+			if statusIdx >= 0 && statusIdx < len(row) {
+				item.TradingStatus = int(moexToFloat(row[statusIdx]))
+			}
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func tradingStatusFromMarketdataBlock(marketdata map[string]interface{}) (string, error) {
@@ -389,7 +595,12 @@ func (c *MOEXClient) getMarketInstruments(endpoint, query string, limit int) []S
 	u, _ := url.Parse(c.baseURL + endpoint)
 	q := u.Query()
 	q.Set("iss.meta", "off")
-	q.Set("securities.columns", "SECID,SHORTNAME")
+	// Добавляем EXPIRATIONDATE для фьючерсов
+	if strings.Contains(endpoint, "futures") {
+		q.Set("securities.columns", "SECID,SHORTNAME,EXPIRATIONDATE")
+	} else {
+		q.Set("securities.columns", "SECID,SHORTNAME")
+	}
 	q.Set("marketdata.columns", "SECID,LAST,NUMTRADES,VALTODAY")
 	u.RawQuery = q.Encode()
 
@@ -418,6 +629,7 @@ func (c *MOEXClient) getMarketInstruments(endpoint, query string, limit int) []S
 
 	secidIdx := findColumnIndex(secCols, "SECID")
 	nameIdx := findColumnIndex(secCols, "SHORTNAME")
+	expiryIdx := findColumnIndex(secCols, "EXPIRATIONDATE")
 	if secidIdx < 0 {
 		return []Security{}
 	}
@@ -484,13 +696,46 @@ func (c *MOEXClient) getMarketInstruments(endpoint, query string, limit int) []S
 			Price:       prices[ticker],
 			NumTrades:   numTrades[ticker],
 			TurnoverRub: turnovers[ticker],
+			ExpiryDate:  parseExpiryDate(row, expiryIdx),
 		})
+		
+		// Сохраняем SHORTNAME в кэш для маппинга тикеров фьючерсов
+		if name != ticker {
+			c.SetShortNameCache(ticker, name)
+		}
+		
 		if len(items) >= limit {
 			break
 		}
 	}
 
 	return items
+}
+
+// parseExpiryDate парсит дату экспирации из строки MOEX ISS (формат: "2026-12-25" или пустая строка)
+func parseExpiryDate(row []interface{}, expiryIdx int) *time.Time {
+	if expiryIdx < 0 || expiryIdx >= len(row) {
+		return nil
+	}
+	dateStr := moexToString(row[expiryIdx])
+	if dateStr == "" {
+		return nil
+	}
+	// MOEX ISS возвращает дату в формате "YYYY-MM-DD"
+	t, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+// IsExpiringSoon возвращает true, если до экспирации меньше minDays дней
+func (s *Security) IsExpiringSoon(minDays int) bool {
+	if s.ExpiryDate == nil {
+		return false // Не фьючерс — не проверяем
+	}
+	daysUntilExpiry := int(time.Until(*s.ExpiryDate).Hours() / 24)
+	return daysUntilExpiry < minDays
 }
 
 func (c *MOEXClient) getLotSizeFromPath(path string, preferredBoards ...string) (int, error) {

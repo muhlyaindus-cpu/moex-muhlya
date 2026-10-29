@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,8 +33,13 @@ var (
 
 func loadDotEnvOnce() {
 	dotenvLoadOnce.Do(func() {
+		// Загружаем .env (секреты: FINAM_SECRET_REAL, PGHOST и т.д.)
 		if err := godotenv.Load(); err != nil {
 			fmt.Println("⚠️  .env file not found, using environment variables")
+		}
+		// Загружаем agent.env (настройки агента: фильтры, TP/SL, фьючерсы и т.д.)
+		if err := godotenv.Load("agent.env"); err != nil {
+			fmt.Println("⚠️  agent.env file not found, using environment variables")
 		}
 	})
 }
@@ -78,6 +84,17 @@ type App struct {
 	universeCachedAt time.Time
 	universe         []services.Security
 
+	// Автообновление тикеров фьючерсов из MOEX ISS (каждую пятницу)
+	futuresOverridesUpdateInterval time.Duration
+	futuresOverridesLastUpdate     time.Time
+	futuresOverridesMu             sync.Mutex
+
+	// Daily Top-N кэш (итеративный выбор инструментов)
+	dailyTopNCache     []services.Security
+	dailyTopNCacheAt   time.Time
+	dailyTopNCacheTTL  time.Duration
+	dailyTopNMu        sync.RWMutex
+
 	statsMu       sync.Mutex
 	statsCachedAt time.Time
 	statsCacheTTL time.Duration
@@ -121,6 +138,9 @@ type App struct {
 	badTickerCooldown time.Duration
 	autoStatusMu      sync.Mutex
 	autoStatus        AutoDecisionStatus
+	blockedTickersMu  sync.Mutex
+	blockedTickers    []BlockedTicker
+	blockedTickersAt  time.Time
 	profitLockMu      sync.Mutex
 	// Трейлинг-пик прибыли по позиции для авто-фиксации.
 	profitLockPeakPct map[string]float64
@@ -170,6 +190,9 @@ type App struct {
 	miyaOnlineSignalMu   sync.Mutex
 	miyaOnlineSignal     miyaOnlineSignal
 	miyaOnlineSignalTill time.Time
+	// Inline MIYA: встроенный режим Мии (запрос MOEX ISS напрямую, без внешнего скрипта)
+	miyaInlineEnabled bool
+	miyaInlineTickers []string
 }
 
 type TradeJournalEntry struct {
@@ -217,6 +240,12 @@ type AutoDecisionStatus struct {
 	BestSellConf           string `json:"best_sell_conf"`
 	ActionTaken            string `json:"action_taken"`
 	Note                   string `json:"note"`
+}
+
+type BlockedTicker struct {
+	Ticker string `json:"ticker"`
+	Reason string `json:"reason"`
+	Type   string `json:"type"` // "stock" или "futures"
 }
 
 type tickerExitLearning struct {
@@ -622,6 +651,41 @@ func (a *App) GetAutoDecisionStatus() AutoDecisionStatus {
 	return a.autoStatus
 }
 
+// GetBlockedTickers возвращает список заблокированных бумаг с причинами блокировки.
+// Кэшируется на 30 секунд, чтобы не долбить MOEX ISS API.
+func (a *App) GetBlockedTickers() []BlockedTicker {
+	a.blockedTickersMu.Lock()
+	defer a.blockedTickersMu.Unlock()
+	
+	// Возвращаем кэш, если он свежий (меньше 30 секунд)
+	if time.Since(a.blockedTickersAt) < 30*time.Second && len(a.blockedTickers) > 0 {
+		return a.blockedTickers
+	}
+	
+	// Получаем свежий список заблокированных
+	universe := a.getUniverseSnapshot(500)
+	blocked := make([]BlockedTicker, 0)
+	
+	for _, s := range universe {
+		allowed, reason := a.isTradingAllowedForTicker(s.Ticker)
+		if !allowed {
+			tickerType := "stock"
+			if isLikelyFuturesTickerLocal(s.Ticker) {
+				tickerType = "futures"
+			}
+			blocked = append(blocked, BlockedTicker{
+				Ticker: s.Ticker,
+				Reason: reason,
+				Type:   tickerType,
+			})
+		}
+	}
+	
+	a.blockedTickers = blocked
+	a.blockedTickersAt = time.Now()
+	return blocked
+}
+
 // ResetAutoContextSoft мягко сбрасывает временные блокировки/паузы автоторговли,
 // не удаляя историю сделок и обучение по журналу.
 func (a *App) ResetAutoContextSoft() bool {
@@ -740,16 +804,37 @@ func (a *App) GetRuntimeEventsPersistent(limit int) []RuntimeEvent {
 
 // affordableQuantity рассчитывает максимально допустимый объем покупки с запасом
 // под комиссии/проскальзывание/резерв.
-func (a *App) affordableQuantity(balance, price float64, desired int, isFutures bool) int {
+func (a *App) affordableQuantity(balance, price float64, desired int, isFutures bool, ticker string) int {
 	if desired <= 0 || balance <= 0 || price <= 0 {
 		return 0
 	}
 
-	// Для акций считаем почти по полной цене, для фьючерсов — более консервативно.
-	// В реальности нужно МО/ГО по инструменту, но пока делаем безопасный эвристический лимит.
+	// Для акций считаем почти по полной цене, для фьючерсов — по ГО (гарантийному обеспечению)
+	// ГО по умолчанию = 15% от стоимости контракта (настраивается через AGENT_FUTURES_MARGIN_RATIO)
 	effectivePrice := price
 	if isFutures {
-		effectivePrice = price * 0.30 // консервативная прокси-оценка требуемого ГО
+		marginRatio := envFloat("AGENT_FUTURES_MARGIN_RATIO", 0.15)
+		if marginRatio <= 0 || marginRatio > 1 {
+			marginRatio = 0.15
+		}
+		effectivePrice = price * marginRatio
+		
+		// Кросс-маржа: если есть акции того же эмитента, можно использовать их как обеспечение
+		// Это увеличивает покупательную способность для фьючерсов
+		crossMarginEnabled := envBool("AGENT_FUTURES_CROSS_MARGIN_ENABLED", true)
+		if crossMarginEnabled {
+			// Проверяем, есть ли акции того же эмитента в портфеле
+			stockTicker := a.extractStockTickerFromFutures(ticker)
+			if stockTicker != "" {
+				stockPosition := a.getPositionQuantity(stockTicker)
+				if stockPosition > 0 {
+					// Есть акции — можно увеличить количество фьючерсов
+					// Упрощённо: считаем что акции покрывают 50% ГО
+					effectivePrice = price * marginRatio * 0.5
+					a.addRuntimeEvent("info", "futures.cross_margin", fmt.Sprintf("%s: акции %s qty=%d используются как обеспечение", ticker, stockTicker, stockPosition))
+				}
+			}
+		}
 	}
 
 	feeAndSlip := 1.003 // 0.3% запас на издержки (фьючерсы / запасной режим)
@@ -1224,9 +1309,9 @@ func (a *App) mtfConfirm(ticker, action string) (bool, string) {
 		// уменьшаем требуемые подтверждения на 1 (по умолчанию), не ниже 2.
 		// Это снижает "тишину" без отключения риск-контура.
 		buyNeed := need
-		buyRelaxDelta := envInt("AGENT_MTF_BUY_RELAX_DELTA", 1)
+		buyRelaxDelta := envFloat("AGENT_MTF_BUY_RELAX_DELTA", 0.0)
 		if buyRelaxDelta > 0 {
-			buyNeed -= buyRelaxDelta
+			buyNeed = int(float64(need) - buyRelaxDelta)
 		}
 		if buyNeed < 2 {
 			buyNeed = 2
@@ -1238,8 +1323,20 @@ func (a *App) mtfConfirm(ticker, action string) (bool, string) {
 		return ok, fmt.Sprintf("mtf buy bull=%d bear=%d avail=%d need=%d", bull, bear, avail, buyNeed)
 	}
 	if strings.EqualFold(action, "sell") {
-		ok := bear >= need
-		return ok, fmt.Sprintf("mtf sell bull=%d bear=%d avail=%d need=%d", bull, bear, avail, need)
+		// Для sell тоже добавляем relax (было только для buy)
+		sellNeed := need
+		sellRelaxDelta := envFloat("AGENT_MTF_SELL_RELAX_DELTA", 0.0)
+		if sellRelaxDelta > 0 {
+			sellNeed = int(float64(need) - sellRelaxDelta)
+		}
+		if sellNeed < 2 {
+			sellNeed = 2
+		}
+		if sellNeed > avail {
+			sellNeed = avail
+		}
+		ok := bear >= sellNeed
+		return ok, fmt.Sprintf("mtf sell bull=%d bear=%d avail=%d need=%d", bull, bear, avail, sellNeed)
 	}
 	return true, "mtf_unknown_action"
 }
@@ -1670,6 +1767,16 @@ func NewApp() *App {
 	exitLearningPath := strings.TrimSpace(envOrDefault("AGENT_EXIT_LEARNING_PATH", "data/exit_learning.json"))
 	miyaHintsPath := strings.TrimSpace(envOrDefault("AGENT_MIA_EXIT_HINTS_PATH", "/var/log/muhlya-reports/agent_exit_hints.env"))
 	miyaOnlineSignalPath := strings.TrimSpace(envOrDefault("AGENT_MIA_ONLINE_SIGNAL_PATH", "/var/log/muhlya-reports/miya_online_signal.env"))
+	// Inline MIYA: встроенный режим Мии (запрос MOEX ISS напрямую)
+	miyaInlineEnabled := envBool("AGENT_MIA_INLINE_ENABLED", true)
+	miyaInlineTickersRaw := strings.TrimSpace(envOrDefault("ONLINE_MIA_API_TICKERS", "SBER,GAZP,LKOH,ROSN,NVTK,TATN,VTBR,MGNT,NLMK,SNGSP,TATNP,SGZH"))
+	miyaInlineTickers := make([]string, 0)
+	for _, t := range strings.Split(miyaInlineTickersRaw, ",") {
+		t = strings.ToUpper(strings.TrimSpace(t))
+		if t != "" {
+			miyaInlineTickers = append(miyaInlineTickers, t)
+		}
+	}
 	runtimeDBMaxSize := envInt("AGENT_RUNTIME_EVENTS_DB_LIMIT", 500)
 	if runtimeDBMaxSize < 50 {
 		runtimeDBMaxSize = 50
@@ -1739,6 +1846,8 @@ func NewApp() *App {
 		miyaHintsPath:             miyaHintsPath,
 		miyaHints:                 make(map[string]float64),
 		miyaOnlineSignalPath:      miyaOnlineSignalPath,
+		miyaInlineEnabled:         miyaInlineEnabled,
+		miyaInlineTickers:         miyaInlineTickers,
 		miyaOnlineSignal: miyaOnlineSignal{
 			State:            "no_data",
 			DataStatus:       "no_data",
@@ -2210,13 +2319,37 @@ func inTimeRange(now time.Time, fromHour, fromMin, toHour, toMin int) bool {
 }
 
 func isLikelyFuturesTickerLocal(ticker string) bool {
-	// Для FORTS тикеров часто характерно наличие цифры в коде контракта.
-	for _, r := range ticker {
-		if r >= '0' && r <= '9' {
-			return true
+	// Фьючерсы MOEX имеют формат: 2-4 буквы + 2 цифры (месяц и год)
+	// Например: MTZ6, SiZ6, BRX6, GZM6
+	// Акции с цифрами: OZON, X5, YNDX — НЕ фьючерсы!
+	
+	ticker = strings.ToUpper(strings.TrimSpace(ticker))
+	
+	// Если тикер содержит @ — проверяем суффикс
+	if strings.Contains(ticker, "@") {
+		return strings.HasSuffix(ticker, "@FUT") || strings.HasSuffix(ticker, "@RTSX")
+	}
+	
+	// Проверяем формат: 2-4 буквы + 2 цифры
+	if len(ticker) < 4 || len(ticker) > 6 {
+		return false
+	}
+	
+	// Последние 2 символа должны быть цифрами
+	lastTwo := ticker[len(ticker)-2:]
+	if lastTwo[0] < '0' || lastTwo[0] > '9' || lastTwo[1] < '0' || lastTwo[1] > '9' {
+		return false
+	}
+	
+	// Первые символы должны быть буквами
+	for i := 0; i < len(ticker)-2; i++ {
+		c := ticker[i]
+		if c < 'A' || c > 'Z' {
+			return false
 		}
 	}
-	return false
+	
+	return true
 }
 
 func (a *App) isTradingAllowedForTicker(ticker string) (bool, string) {
@@ -2556,10 +2689,6 @@ func normalizeMiyaOnlineDailyDataStatus(raw string) string {
 }
 
 func (a *App) loadMiyaOnlineSignalIfNeeded(now time.Time) {
-	path := strings.TrimSpace(a.miyaOnlineSignalPath)
-	if path == "" {
-		return
-	}
 	a.miyaOnlineSignalMu.Lock()
 	if now.Before(a.miyaOnlineSignalTill) {
 		a.miyaOnlineSignalMu.Unlock()
@@ -2568,10 +2697,21 @@ func (a *App) loadMiyaOnlineSignalIfNeeded(now time.Time) {
 	a.miyaOnlineSignalTill = now.Add(30 * time.Second)
 	a.miyaOnlineSignalMu.Unlock()
 
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return
+	path := strings.TrimSpace(a.miyaOnlineSignalPath)
+	if path != "" {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			a.parseMiyaOnlineSignalFile(raw)
+			return
+		}
 	}
+	// Файл не найден или путь пустой — пробуем inline MOEX
+	if a.miyaInlineEnabled && len(a.miyaInlineTickers) > 0 {
+		a.fetchMiyaInlineFromMOEX()
+	}
+}
+
+func (a *App) parseMiyaOnlineSignalFile(raw []byte) {
 	next := miyaOnlineSignal{
 		State:            "no_data",
 		DataStatus:       "no_data",
@@ -2659,6 +2799,78 @@ func (a *App) loadMiyaOnlineSignalIfNeeded(now time.Time) {
 		next.State = "no_data"
 		next.DefaultMul = 1.00
 	}
+	a.miyaOnlineSignalMu.Lock()
+	a.miyaOnlineSignal = next
+	a.miyaOnlineSignalMu.Unlock()
+}
+
+// fetchMiyaInlineFromMOEX — встроенный режим Мии: запрашивает MOEX ISS напрямую
+// для списка тикеров и вычисляет состояние рынка (bullish/bearish/neutral).
+func (a *App) fetchMiyaInlineFromMOEX() {
+	if a.moex == nil || len(a.miyaInlineTickers) == 0 {
+		return
+	}
+
+	snapshot := a.moex.GetMarketSnapshot(a.miyaInlineTickers)
+	if len(snapshot) == 0 {
+		return
+	}
+
+	upCount := 0
+	totalCount := 0
+	type liqEntry struct {
+		ticker   string
+		turnover float64
+	}
+	liquidityData := make([]liqEntry, 0, len(snapshot))
+
+	for _, item := range snapshot {
+		// TRADINGSTATUS=2 означает активные торги
+		if item.TradingStatus != 2 {
+			continue
+		}
+		totalCount++
+		if item.Change > 0 {
+			upCount++
+		}
+		liquidityData = append(liquidityData, liqEntry{item.Ticker, item.TurnoverRub})
+	}
+
+	upRatioPct := 0.0
+	if totalCount > 0 {
+		upRatioPct = float64(upCount) / float64(totalCount) * 100.0
+	}
+
+	state := "neutral"
+	if upRatioPct >= 55 {
+		state = "bullish"
+	} else if upRatioPct <= 35 {
+		state = "bearish"
+	}
+
+	sort.Slice(liquidityData, func(i, j int) bool {
+		return liquidityData[i].turnover > liquidityData[j].turnover
+	})
+	liquidityOrder := make([]string, 0, len(liquidityData))
+	for _, ld := range liquidityData {
+		liquidityOrder = append(liquidityOrder, ld.ticker)
+	}
+
+	next := miyaOnlineSignal{
+		State:            state,
+		DataStatus:       "ok",
+		DefaultMul:       1.00,
+		UpRatioPct:       math.Round(upRatioPct*100) / 100,
+		TickersLongCount: totalCount,
+		DailyState:       "no_data",
+		DailyDataStatus:  "no_data",
+		DailyDefaultMul:  1.00,
+		DailyUpRatioPct:  0,
+		LiquidityOrder:   liquidityOrder,
+		LiquidityStatus:  "ok",
+		WatchTickers:     a.miyaInlineTickers,
+	}
+
 	a.miyaOnlineSignalMu.Lock()
 	a.miyaOnlineSignal = next
 	a.miyaOnlineSignalMu.Unlock()
@@ -2794,6 +3006,8 @@ func (a *App) startup(ctx context.Context) {
 			a.addRuntimeEvent("error", "startup.finam_error", err.Error())
 		} else {
 			a.broker = broker
+			// Передаём MOEXClient для доступа к кэшу SHORTNAME (маппинг тикеров фьючерсов)
+			broker.SetMOEXClient(a.moex)
 			fmt.Println("✅ Connected to Finam Trade API (REAL account)")
 			a.addRuntimeEvent("info", "startup.finam_connected", "connected to real account")
 		}
@@ -2815,6 +3029,17 @@ func (a *App) startup(ctx context.Context) {
 		a.addRuntimeEvent("info", "startup.futures_allowlist_mode", fmt.Sprintf("auto_learn=%t", a.futuresAllowlistAutoLearn))
 	}
 	a.addRuntimeEvent("info", "market.session_rules", "stock/futures sessions are tracked independently with clearing windows")
+
+	// Синхронизируем позиции из Finam API при старте
+	a.syncPositionsFromBroker()
+
+	// Запускаем автообновление тикеров фьючерсов из MOEX ISS
+	a.startFuturesOverridesAutoUpdate()
+
+	// Инициализируем TTL кэша Daily Top-N
+	topNTTLHours := envInt("AGENT_DAILY_TOP_CACHE_TTL_HOURS", 8)
+	a.dailyTopNCacheTTL = time.Duration(topNTTLHours) * time.Hour
+
 	// По умолчанию запускаем авто-режим после старта, если есть рабочий брокер.
 	// В любой момент можно перейти в manual через UI.
 	if a.broker != nil && a.userAutoPreferred {
@@ -3913,7 +4138,7 @@ func (a *App) autoLoop(ctx context.Context) {
 							qty = coverQty
 						}
 					}
-					execQty := a.affordableQuantity(autoBudgetBal, s.Price, qty, isFuturesTicker)
+					execQty := a.affordableQuantity(autoBudgetBal, s.Price, qty, isFuturesTicker, s.Ticker)
 					execQty = a.floorToLot(s.Ticker, execQty)
 					if execQty <= 0 {
 						buyCandidatesRejectedAffordable++
@@ -3938,6 +4163,10 @@ func (a *App) autoLoop(ctx context.Context) {
 					}
 					expectedProfitScore := expectedEdge*expectedProfitWeight - roundTripCostPct*expectedProfitCostScale
 					rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + expectedProfitScore
+					// Бонус для фьючерсов: +0.10 к rankScore, чтобы они чаще попадали в топ-кандидатов
+					if isFuturesTicker {
+						rankScore += 0.10
+					}
 					if execRatio < affordabilityMinExecRatio {
 						rankScore -= (affordabilityMinExecRatio - execRatio) * affordabilityScoreWeight
 					}
@@ -4004,6 +4233,14 @@ func (a *App) autoLoop(ctx context.Context) {
 					}
 					if turnover > 0 && turnover < liqTurnover {
 						continue
+					}
+					// Проверка экспирации для фьючерсов
+					if isLikelyFuturesTickerLocal(s.Ticker) && s.ExpiryDate != nil {
+						minDaysToExpiry := envInt("AGENT_FUTURES_MIN_DAYS_TO_EXPIRY", 7)
+						if s.IsExpiringSoon(minDaysToExpiry) {
+							a.addRuntimeEvent("info", "auto.skip_expiry_soon", fmt.Sprintf("%s expires in %d days (min=%d)", s.Ticker, int(time.Until(*s.ExpiryDate).Hours()/24), minDaysToExpiry))
+							continue
+						}
 					}
 					res := a.AnalyzeWithAgent(s.Ticker)
 					action, _ := res["action"].(string)
@@ -4077,7 +4314,7 @@ func (a *App) autoLoop(ctx context.Context) {
 								qty = coverQty
 							}
 						}
-						execQty := a.affordableQuantity(autoBudgetBal, s.Price, qty, isFuturesTicker)
+						execQty := a.affordableQuantity(autoBudgetBal, s.Price, qty, isFuturesTicker, s.Ticker)
 						execQty = a.floorToLot(s.Ticker, execQty)
 						if execQty <= 0 {
 							buyCandidatesRejectedAffordable++
@@ -4102,6 +4339,10 @@ func (a *App) autoLoop(ctx context.Context) {
 						}
 						expectedProfitScore := expectedEdge*expectedProfitWeight - roundTripCostPct*expectedProfitCostScale
 						rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + expectedProfitScore
+						// Бонус для фьючерсов: +0.10 к rankScore, чтобы они чаще попадали в топ-кандидатов
+						if isFuturesTicker {
+							rankScore += 0.10
+						}
 						if execRatio < affordabilityMinExecRatio {
 							rankScore -= (affordabilityMinExecRatio - execRatio) * affordabilityScoreWeight
 						}
@@ -4516,6 +4757,148 @@ func (a *App) autoLoop(ctx context.Context) {
 	}
 }
 
+// startFuturesOverridesAutoUpdate запускает фоновое автообновление тикеров фьючерсов из MOEX ISS.
+// Обновление происходит при старте и далее каждые 7 дней (или как настроено в env).
+func (a *App) startFuturesOverridesAutoUpdate() {
+	// Интервал обновления: по умолчанию 7 дней, можно настроить через env
+	intervalHours := envInt("AGENT_FUTURES_OVERRIDES_UPDATE_INTERVAL_HOURS", 168) // 168h = 7 дней
+	a.futuresOverridesUpdateInterval = time.Duration(intervalHours) * time.Hour
+	
+	// Проверяем, нужно ли обновление при старте
+	if a.shouldUpdateFuturesOverrides() {
+		go a.updateFuturesOverridesFromMOEX()
+	}
+	
+	// Запускаем фоновый цикл проверки
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour) // Проверяем раз в час
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+				if a.shouldUpdateFuturesOverrides() {
+					a.updateFuturesOverridesFromMOEX()
+				}
+			}
+		}
+	}()
+	
+	a.addRuntimeEvent("info", "startup.futures_overrides_autoupdate", fmt.Sprintf("interval=%dh", intervalHours))
+}
+
+// shouldUpdateFuturesOverrides проверяет, нужно ли обновить тикеры фьючерсов
+func (a *App) shouldUpdateFuturesOverrides() bool {
+	a.futuresOverridesMu.Lock()
+	defer a.futuresOverridesMu.Unlock()
+	
+	// Если никогда не обновляли — нужно обновить
+	if a.futuresOverridesLastUpdate.IsZero() {
+		return true
+	}
+	
+	// Если прошло больше интервала — нужно обновить
+	return time.Since(a.futuresOverridesLastUpdate) > a.futuresOverridesUpdateInterval
+}
+
+// updateFuturesOverridesFromMOEX получает свежие тикеры фьючерсов из MOEX ISS и обновляет overrides файл
+func (a *App) updateFuturesOverridesFromMOEX() {
+	a.futuresOverridesMu.Lock()
+	if !a.futuresOverridesLastUpdate.IsZero() && time.Since(a.futuresOverridesLastUpdate) < a.futuresOverridesUpdateInterval {
+		a.futuresOverridesMu.Unlock()
+		return
+	}
+	a.futuresOverridesMu.Unlock()
+	
+	a.addRuntimeEvent("info", "futures_overrides.update_started", "получение свежих тикеров из MOEX ISS")
+	
+	// Получаем список фьючерсов из MOEX ISS
+	futures := a.moex.GetFuturesInstruments("", 500)
+	if len(futures) == 0 {
+		a.addRuntimeEvent("warn", "futures_overrides.update_failed", "MOEX ISS вернул пустой список фьючерсов")
+		return
+	}
+	
+	// Читаем существующий overrides файл
+	overridesPath := "finam_symbol_overrides_screener.json"
+	existingData, err := os.ReadFile(overridesPath)
+	if err != nil {
+		a.addRuntimeEvent("warn", "futures_overrides.read_failed", fmt.Sprintf("не удалось прочитать %s: %v", overridesPath, err))
+		return
+	}
+	
+	var overrides map[string]string
+	if err := json.Unmarshal(existingData, &overrides); err != nil {
+		a.addRuntimeEvent("warn", "futures_overrides.parse_failed", fmt.Sprintf("не удалось распарсить %s: %v", overridesPath, err))
+		return
+	}
+	
+	// Обновляем маппинг тикеров фьючерсов
+	updatedCount := 0
+	for _, f := range futures {
+		if f.Ticker == "" || f.Name == "" || f.Name == f.Ticker {
+			continue
+		}
+		
+		// Извлекаем базовый тикер из SHORTNAME (например, "MTSI-12.26" → "MTSI")
+		baseTicker := extractBaseTickerFromName(f.Name)
+		if baseTicker == "" {
+			continue
+		}
+		
+		// Формируем тикер для Finam API
+		// Finam API использует формат TICKER@RTSX для фьючерсов (например, MTZ6@RTSX)
+		finamTicker := f.Ticker + "@RTSX"
+		
+		// Обновляем маппинг для SECID (например, "MTZ6" → "MTSI-12.26@FUT")
+		if overrides[f.Ticker] != finamTicker {
+			overrides[f.Ticker] = finamTicker
+			updatedCount++
+		}
+		
+		// Также обновляем маппинг для базового тикера (например, "MTSI" → "MTSI-12.26@FUT")
+		if overrides[baseTicker] != finamTicker {
+			overrides[baseTicker] = finamTicker
+			updatedCount++
+		}
+	}
+	
+	// Записываем обновлённый файл
+	updatedData, err := json.MarshalIndent(overrides, "", "  ")
+	if err != nil {
+		a.addRuntimeEvent("warn", "futures_overrides.marshal_failed", fmt.Sprintf("не удалось сериализовать: %v", err))
+		return
+	}
+	
+	if err := os.WriteFile(overridesPath, updatedData, 0644); err != nil {
+		a.addRuntimeEvent("warn", "futures_overrides.write_failed", fmt.Sprintf("не удалось записать %s: %v", overridesPath, err))
+		return
+	}
+	
+	// Обновляем кэш broker
+	if a.broker != nil {
+		a.broker.ReloadSymbolOverrides()
+	}
+	
+	a.futuresOverridesMu.Lock()
+	a.futuresOverridesLastUpdate = time.Now()
+	a.futuresOverridesMu.Unlock()
+	
+	a.addRuntimeEvent("info", "futures_overrides.update_completed", fmt.Sprintf("обновлено %d тикеров из %d фьючерсов", updatedCount, len(futures)))
+}
+
+// extractBaseTickerFromName извлекает базовый тикер из SHORTNAME
+// Например: "MTSI-12.26" → "MTSI", "Si-6.25" → "Si"
+func extractBaseTickerFromName(name string) string {
+	for i, ch := range name {
+		if ch == '-' || ch == '.' {
+			return strings.TrimSpace(name[:i])
+		}
+	}
+	return strings.TrimSpace(name)
+}
+
 func (a *App) getUniverseSnapshot(limitPerClass int) []services.Security {
 	a.universeMu.Lock()
 	defer a.universeMu.Unlock()
@@ -4552,6 +4935,13 @@ func (a *App) getAutoUniverseSnapshot(limitPerClass int) []services.Security {
 			},
 		}
 	}
+
+	// Daily Top-N стратегия: отбираем топ-N ликвидных инструментов
+	dailyTopNEnabled := envBool("AGENT_DAILY_TOP_N_ENABLED", false)
+	if dailyTopNEnabled {
+		return a.getDailyTopN(limitPerClass)
+	}
+
 	switch mode {
 	case "stocks":
 		return a.applyStockAllowlist(a.moex.GetStockInstruments("", limitPerClass))
@@ -4564,6 +4954,61 @@ func (a *App) getAutoUniverseSnapshot(limitPerClass int) []services.Security {
 	default:
 		return a.getUniverseSnapshot(limitPerClass)
 	}
+}
+
+// getDailyTopN отбирает топ-N самых ликвидных инструментов и кэширует на весь день
+func (a *App) getDailyTopN(limitPerClass int) []services.Security {
+	a.dailyTopNMu.RLock()
+	// Проверяем, актуален ли кэш
+	if len(a.dailyTopNCache) > 0 && time.Since(a.dailyTopNCacheAt) < a.dailyTopNCacheTTL {
+		cache := a.dailyTopNCache
+		a.dailyTopNMu.RUnlock()
+		return cache
+	}
+	a.dailyTopNMu.RUnlock()
+
+	// Кэш устарел или пуст — обновляем
+	a.dailyTopNMu.Lock()
+	defer a.dailyTopNMu.Unlock()
+
+	// Двойная проверка после получения блокировки
+	if len(a.dailyTopNCache) > 0 && time.Since(a.dailyTopNCacheAt) < a.dailyTopNCacheTTL {
+		return a.dailyTopNCache
+	}
+
+	a.addRuntimeEvent("info", "daily_top_n.updating", "обновление списка топ-N ликвидных инструментов")
+
+	// Получаем все инструменты
+	allInstruments := a.getUniverseSnapshot(limitPerClass)
+
+	// Сортируем по ликвидности (turnover или numtrades)
+	criteria := envOrDefault("AGENT_DAILY_TOP_CRITERIA", "turnover")
+	sort.SliceStable(allInstruments, func(i, j int) bool {
+		if criteria == "numtrades" {
+			return allInstruments[i].NumTrades > allInstruments[j].NumTrades
+		}
+		return allInstruments[i].TurnoverRub > allInstruments[j].TurnoverRub
+	})
+
+	// Берём топ-N
+	topN := envInt("AGENT_DAILY_TOP_N", 15)
+	if topN < 5 {
+		topN = 5
+	}
+	if topN > 50 {
+		topN = 50
+	}
+	if len(allInstruments) > topN {
+		allInstruments = allInstruments[:topN]
+	}
+
+	// Кэшируем
+	a.dailyTopNCache = allInstruments
+	a.dailyTopNCacheAt = time.Now()
+
+	a.addRuntimeEvent("info", "daily_top_n.updated", fmt.Sprintf("обновлено: %d инструментов (критерий: %s)", len(allInstruments), criteria))
+
+	return allInstruments
 }
 
 func envOrDefault(key, def string) string {
@@ -4793,6 +5238,30 @@ func (a *App) GetFuturesWatchlist() []services.Security {
 }
 
 // GetPortfolio возвращает портфель
+// syncPositionsFromBroker синхронизирует позиции из Finam API с локальной БД
+func (a *App) syncPositionsFromBroker() {
+	if a.broker == nil || a.db == nil {
+		return
+	}
+	
+	ctx := context.Background()
+	positions, err := a.broker.GetPortfolio(ctx)
+	if err != nil {
+		fmt.Printf("⚠️  Failed to get portfolio from broker: %v\n", err)
+		return
+	}
+	
+	// Очищаем старые позиции и записываем новые
+	a.db.ClearPositions()
+	for _, p := range positions {
+		if p.Quantity != 0 { // Только открытые позиции
+			a.db.UpsertPosition(p.Ticker, p.Quantity, p.AvgPrice)
+		}
+	}
+	
+	a.addRuntimeEvent("info", "positions.synced", fmt.Sprintf("синхронизировано %d позиций из Finam", len(positions)))
+}
+
 func (a *App) GetPortfolio() []services.Position {
 	if a.broker != nil {
 		ctx := context.Background()
@@ -5222,6 +5691,8 @@ func (a *App) PlaceSLTPBrackets(ticker string, closeSide string, slQty int, slPr
 
 // BuyPosition покупает акцию
 func (a *App) BuyPosition(ticker string, quantity int, price float64) bool {
+	// Округляем цену до 2 знаков после запятой (требование Finam API)
+	price = math.Round(price*100) / 100
 	if a.mode == engine.ModePaper {
 		if a.db == nil {
 			return false
@@ -5273,7 +5744,7 @@ func (a *App) BuyPosition(ticker string, quantity int, price float64) bool {
 		}
 		quantity = normalizedQty
 		if bal, err := a.broker.GetBalance(context.Background()); err == nil {
-			qty := a.affordableQuantity(bal, price, quantity, isLikelyFuturesTickerLocal(ticker))
+			qty := a.affordableQuantity(bal, price, quantity, isLikelyFuturesTickerLocal(ticker), ticker)
 			if qty <= 0 {
 				fmt.Printf("🛑 Buy blocked by cash limit: ticker=%s qty=%d price=%.2f bal=%.2f\n", ticker, quantity, price, bal)
 				return false
@@ -5346,6 +5817,7 @@ func (a *App) BuyPosition(ticker string, quantity int, price float64) bool {
 			msg := strings.ToLower(err.Error())
 			isInvalidQty := strings.Contains(msg, "invalid quantity value") || strings.Contains(msg, "неверное значение параметра 'количество'")
 			isMoneyShortage := strings.Contains(msg, "[156]") || strings.Contains(msg, "money shortage") || strings.Contains(msg, "не хватает денежных средств")
+			isPriceLimits := strings.Contains(msg, "(10032)") || strings.Contains(msg, "price limits") || strings.Contains(msg, "price should be specified")
 			if isInvalidQty && quantity > lot {
 				retryQty := floorQuantityByLot(quantity-lot, lot)
 				if retryQty > 0 && retryQty < quantity {
@@ -5369,6 +5841,11 @@ func (a *App) BuyPosition(ticker string, quantity int, price float64) bool {
 				a.addRuntimeEvent("warn", "order.blocked_cash", fmt.Sprintf("%s qty=%d price=%.2f", ticker, quantity, price))
 				a.rememberRecentAutoTicker(ticker, 2*time.Minute)
 				a.setBuyCashPause(90 * time.Second)
+			}
+			if isPriceLimits {
+				a.addRuntimeEvent("warn", "order.blocked_price_limits", fmt.Sprintf("%s qty=%d price=%.2f — цена вне лимитов Finam", ticker, quantity, price))
+				a.rememberRecentAutoTicker(ticker, 10*time.Minute)
+				a.registerBrokerValidationFailure(ticker, err)
 			}
 			fmt.Printf("❌ Order failed: %v\n", err)
 			a.addRuntimeEvent("error", "order.buy_failed", fmt.Sprintf("%s qty=%d err=%v", ticker, quantity, err))
@@ -5405,6 +5882,8 @@ func (a *App) SellPosition(ticker string, quantity int, price float64) bool {
 
 // OpenShortPosition открывает short по акции (без требования long-остатка).
 func (a *App) OpenShortPosition(ticker string, quantity int, price float64) bool {
+	// Округляем цену до 2 знаков после запятой (требование Finam API)
+	price = math.Round(price*100) / 100
 	return a.sellPositionInternal(ticker, quantity, price, true)
 }
 
@@ -5535,6 +6014,15 @@ func (a *App) sellPositionInternal(ticker string, quantity int, price float64, a
 			msg := strings.ToLower(err.Error())
 			isShortage := strings.Contains(msg, "[157]") || strings.Contains(msg, "equities shortage") || strings.Contains(msg, "не хватает собственных бумаг")
 			isQualification := strings.Contains(msg, "[257]") || strings.Contains(msg, "требующие тестирования") || strings.Contains(msg, "confirm your qualification level")
+			isPriceError := strings.Contains(msg, "[34]") || strings.Contains(msg, "invalid value for field: price")
+			
+			// Fallback на фьючерсы при ошибке шорта акции
+			if allowShortOpen && (isShortage || isQualification || isPriceError) {
+				if a.tryShortFuturesFallback(ticker, quantity, price) {
+					return true
+				}
+			}
+			
 			if isShortage && !allowShortOpen {
 				refreshedQty, clampErr := a.clampSellQuantityToAvailableLong(ticker, quantity)
 				if clampErr == nil && refreshedQty > 0 && refreshedQty < quantity {
@@ -5701,7 +6189,7 @@ func (a *App) BuyFutures(ticker string, quantity int, price float64) bool {
 	}
 	quantity = normalizedQty
 	if bal, err := a.broker.GetBalance(context.Background()); err == nil {
-		qty := a.affordableQuantity(bal, price, quantity, true)
+		qty := a.affordableQuantity(bal, price, quantity, true, ticker)
 		if qty <= 0 {
 			fmt.Printf("🛑 Futures buy blocked by cash limit: ticker=%s qty=%d price=%.2f bal=%.2f\n", ticker, quantity, price, bal)
 			return false
@@ -6560,4 +7048,107 @@ func (a *App) GetRejectRateTable(limit int) []TickerRejectStats {
 		out = out[:limit]
 	}
 	return out
+}
+
+// extractStockTickerFromFutures извлекает тикер акции из тикера фьючерса
+// Например: "AFZ6@RTSX" → "AFLT", "MTZ6@RTSX" → "MTSS"
+func (a *App) extractStockTickerFromFutures(futuresTicker string) string {
+	// Таблица обратного маппинга фьючерсов → акции
+	futuresToStock := map[string]string{
+		"AFZ6": "AFLT",  // Аэрофлот
+		"GZM6": "GAZP",  // Газпром
+		"LKZ6": "LKOH",  // Лукойл
+		"NVZ6": "NVTK",  // Новатэк
+		"RNZ6": "ROSN",  // Роснефть
+		"SBZ6": "SBER",  // Сбербанк
+		"VBZ6": "VTBR",  // ВТБ
+		"MNZ6": "MGNT",  // Магнит
+		"MTZ6": "MTSS",  // МТС
+		"TNZ6": "TATN",  // Татнефть
+	}
+	
+	// Убираем @RTSX и т.д.
+	baseTicker := strings.Split(futuresTicker, "@")[0]
+	baseTicker = strings.ToUpper(baseTicker)
+	
+	if stockTicker, ok := futuresToStock[baseTicker]; ok {
+		return stockTicker
+	}
+	
+	return ""
+}
+
+// getPositionQuantity возвращает количество акций в портфеле
+func (a *App) getPositionQuantity(ticker string) int {
+	if a.db == nil {
+		return 0
+	}
+	positions, err := a.db.GetPositions()
+	if err != nil {
+		return 0
+	}
+	for _, p := range positions {
+		if strings.EqualFold(p.Ticker, ticker) || strings.EqualFold(p.Ticker, ticker+"@MISX") {
+			return p.Quantity
+		}
+	}
+	return 0
+}
+
+// tryShortFuturesFallback пытается шортить фьючерс вместо акции при ошибке
+func (a *App) tryShortFuturesFallback(stockTicker string, quantity int, price float64) bool {
+	// Ищем фьючерс того же эмитента
+	futuresTicker := a.findFuturesForStock(stockTicker)
+	if futuresTicker == "" {
+		a.addRuntimeEvent("warn", "short_fallback.no_futures", fmt.Sprintf("%s — фьючерс не найден", stockTicker))
+		return false
+	}
+	
+	a.addRuntimeEvent("info", "short_fallback.trying", fmt.Sprintf("%s → %s (фьючерс вместо акции)", stockTicker, futuresTicker))
+
+	// Пробуем шортить фьючерс
+	// Убираем суффикс @RTSX для запроса цены из MOEX ISS
+	priceTicker := strings.Split(futuresTicker, "@")[0]
+	futuresPrice, err := a.moex.GetCurrentPrice(priceTicker)
+	if err != nil || futuresPrice <= 0 {
+		a.addRuntimeEvent("warn", "short_fallback.no_price", fmt.Sprintf("%s — не удалось получить цену", futuresTicker))
+		return false
+	}
+	
+	// Открываем шорт по фьючерсу
+	success := a.OpenShortPosition(futuresTicker, quantity, futuresPrice)
+	if success {
+		a.addRuntimeEvent("info", "short_fallback.success", fmt.Sprintf("%s → %s qty=%d price=%.2f", stockTicker, futuresTicker, quantity, futuresPrice))
+	} else {
+		a.addRuntimeEvent("warn", "short_fallback.failed", fmt.Sprintf("%s → %s — не удалось открыть шорт", stockTicker, futuresTicker))
+	}
+	
+	return success
+}
+
+// findFuturesForStock ищет фьючерс того же эмитента по таблице маппинга
+func (a *App) findFuturesForStock(stockTicker string) string {
+	// Таблица маппинга акций → фьючерсов (будет расширяться автоматически)
+	stockToFutures := map[string]string{
+		"AFLT": "AFZ6@RTSX",  // Аэрофлот
+		"GAZP": "GZM6@RTSX",  // Газпром
+		"LKOH": "LKZ6@RTSX",  // Лукойл
+		"NVTK": "NVZ6@RTSX",  // Новатэк
+		"ROSN": "RNZ6@RTSX",  // Роснефть
+		"SBER": "SBZ6@RTSX",  // Сбербанк
+		"VTBR": "VBZ6@RTSX",  // ВТБ
+		"MGNT": "MNZ6@RTSX",  // Магнит
+		"MTSS": "MTZ6@RTSX",  // МТС
+		"TATN": "TNZ6@RTSX",  // Татнефть
+	}
+	
+	// Нормализуем тикер (убираем @MISX и т.д.)
+	normalizedTicker := strings.Split(stockTicker, "@")[0]
+	normalizedTicker = strings.ToUpper(normalizedTicker)
+	
+	if futuresTicker, ok := stockToFutures[normalizedTicker]; ok {
+		return futuresTicker
+	}
+	
+	return ""
 }

@@ -1,0 +1,20 @@
+[Unit]
+Description=Muhlya Trading Bot (headless)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=traderbot
+Group=traderbot
+WorkingDirectory=/opt/trading/app/moex-trader-gui
+EnvironmentFile=/opt/trading/app/moex-trader-gui/.env
+EnvironmentFile=/opt/trading/app/moex-trader-gui/agent.env
+ExecStart=/opt/trading/app/moex-trader-gui/muhlya-headless
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

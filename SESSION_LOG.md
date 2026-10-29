@@ -4,6 +4,129 @@
 
 ---
 
+## 2026-10-29
+
+### 🔧 Исправлен MDMG Invalid Price (2026-10-29)
+- **Проблема:** робот массово пытался купить MDMG @ ~1291.30, но Finam API отклонял с ошибкой `{34}Invalid value for field: Price`. 208 rejected trades за последние сутки.
+- **Корень:** `strconv.FormatFloat(limitPrice, 'f', -1, 64)` давал "1291.3" (минимум знаков). Для MDMG на TQBR DECIMALS=1, но Finam API требовал формат с правильным количеством знаков после запятой.
+- **Решение:**
+  - Добавлен `GetDecimals(ticker string) int` в `services/moex.go` — получает DECIMALS из MOEX ISS (securities block) с кэшированием
+  - В `placeOrder` (`finam_broker.go`) цена форматируется: `strconv.FormatFloat(limitPrice, 'f', decimals, 64)` где decimals = `GetDecimals(ticker)`
+  - Дефолт DECIMALS=2 если не удалось определить из MOEX ISS
+- **Результат:** цена теперь отправляется в правильном формате для каждого инструмента
+
+### 📡 Реализован Inline MIYA — Мия работает локально (2026-10-29)
+- **Проблема:** Мия не работала локально — `miya-online-watch.sh` это bash-скрипт для VPS, на Windows не запускается. Мухля получала `miya_state=no_data`.
+- **Решение:** встроенный inline-режим Мии прямо в Go-коде:
+  - `services/moex.go`: `GetMarketSnapshot(tickers)` — запрашивает MOEX ISS для списка тикеров (LAST, CHANGE, VALTODAY, TRADINGSTATUS)
+  - `app.go`: `fetchMiyaInlineFromMOEX()` — вычисляет state (bullish/bearish/neutral), up_ratio, liquidity order
+  - Автоматически включён по умолчанию (`AGENT_MIA_INLINE_ENABLED=true`)
+  - Срабатывает когда файл `miya_online_signal.env` не найден (локальный режим)
+- **Логика:**
+  - Запрос MOEX ISS для каждого тикера (TQBR board)
+  - Фильтрация по TRADINGSTATUS=2 (активные торги)
+  - up_ratio = % тикеров с положительным CHANGE
+  - state: bullish (>=55%), bearish (<=35%), neutral
+  - liquidity order: сортировка по VALTODAY
+- **Результат:** Мухля теперь получает данные Мии локально, без внешних скриптов
+
+### 📊 Проверка логов (2026-10-29, ~07:41 МСК)
+- **Баланс:** 35,685.82₽ (↓ с ~39,625₽)
+- **Открытые позиции:** AKGD (28 шт), AMGL (37 шт), AKPP (83 шт), AFZ6@RTSX (short 1 контракт)
+- **Проблемы до фикса:** MDMG spam (208 rejected), Мия no_data, 25 тикеров заблокировано (ночная пауза)
+- **Успешные сделки (placed):** AFZ6@RTSX buy 1 @ 3,877₽, AKGD sell 28 @ 232.04₽
+
+### 🔧 Исправлен MDMG Price Limits (10032) (2026-10-29, ~11:00 МСК)
+- **Проблема:** после фикса GetDecimals (код {34} ушёл), Finam отклонял MDMG с ошибкой `(10032) The price should be specified within the price limits`. 227 rejected trades за 3 часа.
+- **Корень:** Finam API для акций требует минимум 2 знака после запятой в цене, даже если DECIMALS=1 на бирже.
+- **Решение:**
+  - В `placeOrder` (`finam_broker.go`): для акций минимум 2 знака (`if !isLikelyFutureTicker && d < 2 { d = 2 }`)
+  - В `buyPosition` (`app.go`): обработка ошибки (10032) — cooldown 10 минут + broker validation failure
+- **Результат:** MDMG цена теперь "1289.00" (2 знака); при повторной ошибке — тикер в cooldown на 10 минут
+
+### 📊 Анализ логов и план улучшения (2026-10-29, ~11:00 МСК)
+- **Баланс:** 40,767₽ (↑ с 35,685₽ за 2 дня)
+- **Позиции:** AKPP 59шт, AMGL 37шт, DATA 4шт
+- **Мия:** inline MIYA работает (state=bearish, data_status=ok)
+- **Успешные сделки за 3 часа:** 13 placed (AKPP, DATA)
+- **План улучшения Мухли:**
+  1. ✅ MDMG price limits fix (реализовано)
+  2. ⏳ MTF filter relax (AGENT_MTF_BUY_RELAX_DELTA 0.15 → 0.20)
+  3. ⏳ Ежедневный мониторинг от Кристины
+- **Роль Мии:** текущий алгоритм работает; позже — сделать полноценным агентом с AI-аналитикой
+
+---
+
+## 2026-10-27
+
+### 🎉 ПЕРВАЯ УСПЕШНАЯ СДЕЛКА ПО ФЬЮЧЕРСУ! (2026-10-27, 21:11 МСК)
+- **MTZ6 (фьючерс МТС):** buy @ 18,127₽ → sell @ 18,091₽ — обе сделки **placed** ✅
+- **Формат тикера:** `MTZ6@RTSX` (НЕ `MTSI-12.26@FUT` — это было неправильно!)
+- **Исправление:** в `formatSymbolForREST` (finam_broker.go) для фьючерсов добавляется `@RTSX` вместо `@FUT`
+- **Автообновление тикеров:** работает, обновлено 556 тикеров из MOEX ISS
+
+### Автообновление тикеров фьючерсов из MOEX ISS (2026-10-27, ~20:50 МСК)
+- **Создан скрипт:** `scripts/update_futures_overrides.py` — получает свежие тикеры из MOEX ISS
+- **Встроен в GUI:** `startFuturesOverridesAutoUpdate()` в app.go — автообновление каждые 7 дней (168 часов)
+- **Как работает:** при старте GUI проверяет, нужно ли обновить тикеры; если да — получает из MOEX ISS и записывает в `finam_symbol_overrides_screener.json`
+- **Настройка:** `AGENT_FUTURES_OVERRIDES_UPDATE_INTERVAL_HOURS=168` в agent.env
+
+### Проблема с форматом тикеров фьючерсов (2026-10-27, ~20:00 МСК)
+- **Ошибка:** `Security id doesn't exist for mic: FUT and ticker: MTSI-12.26`
+- **Причина:** Finam API использует формат `TICKER@RTSX` (например, `MTZ6@RTSX`), а не `SHORTNAME@FUT` (например, `MTSI-12.26@FUT`)
+- **Решение:** исправлен `formatSymbolForREST` в finam_broker.go — для фьючерсов добавляется `@RTSX`
+
+### Исправление бага Finam API для фьючерсов (2026-10-27, ~19:40 МСК)
+- **Проблема:** при покупке/продаже фьючерсов (MTZ6, NVTK) через терминал возникала ошибка `rpc error: code = InvalidArgument desc = Mic must not be empty`.
+- **Причина:** Finam gRPC API требует MIC (Market Identifier Code) для фьючерсов, но `GetAssetRequest` не имеет поля MIC — это баг или недокументированное поведение API.
+- **Решение:** отключена preflight проверка `AGENT_FINAM_GETASSET_PREFLIGHT=0` в `agent.env`. Это позволяет покупать/продавать фьючерсы без проверки через `GetAsset`.
+- **Влияние:** исправление касается и покупки (`BuyFutures`), и продажи (`SellFutures`) фьючерсов.
+- **Контекст:** через приложение Finam покупка фьючерсов работала без проблем. Проблема только в нашем терминале.
+
+### Создание окна "Заблокированные бумаги" в GUI (2026-10-27, ~18:00 МСК)
+- **Добавлено:** отдельное окно в Dashboard.vue для просмотра заблокированных бумаг с причинами блокировки.
+- **Go backend:** структура `BlockedTicker`, поля `blockedTickers`/`blockedTickersAt`, метод `GetBlockedTickers()` (кэш на 30 секунд).
+- **Vue frontend:** UI-компонент с таблицей (Ticker, Тип, Причина), кнопка обновления, автозагрузка при старте.
+- **Цель:** помочь диагностировать, какие бумаги заблокированы и почему (TRADINGSTATUS=B, квалификация и т.д.).
+
+### Ослабление фильтров Мухли (2026-10-27, ~08:30 МСК)
+- **Проблема:** Мухля не открывал сделки — фильтры содержали противоречие (RSI < 28 + trendBull почти никогда не выполняются одновременно).
+- **Решение — ослаблены фильтры в `agent.env`:**
+  - `AGENT_REQUIRE_TREND_FILTER=0` (было 1) — отключено требование тренда
+  - `AGENT_REQUIRE_MACD_CONFIRM=0` (было 1) — отключено требование MACD
+  - `AGENT_RSI_PULLBACK_BUY_MAX=50` (было 45) — смягчён RSI-порог для покупки
+  - `AGENT_RSI_PULLBACK_SELL_MIN=50` (было 55) — смягчён RSI-порог для продажи
+  - `AGENT_VOLATILITY_MAX_PCT=5.0` (было 4.0) — расширен допустимый диапазон волатильности
+  - `AGENT_BUY_CONF_THRESHOLD=0.55` (было 0.68) — снижен порог уверенности для покупки
+  - `AGENT_SELL_CONF_THRESHOLD=0.50` (было 0.60) — снижен порог уверенности для продажи
+  - `AGENT_SHORT_CONF_THRESHOLD=0.65` (было 0.74) — снижен порог для шорта
+- **Ожидаемый эффект:** робот начнёт открывать сделки, появятся данные для анализа качества стратегии.
+- **Риск:** больше шума, меньше качества входов — нужно мониторить PnL и корректировать.
+
+### Статус квалифицированного инвестора
+- **Текущий статус:** НЕ квалифицированный инвестор (на 2026-10-27).
+- **Влияние:** некоторые бумаги (фьючерсы, сложные инструменты) заблокированы для торговли.
+- **Действие:** информация добавлена в `CHAT_CONTEXT_PACKET.md`; после получения статуса — обновить конфигурацию.
+
+### Локальный режим: оптимизация Мухли для увеличения баланса
+- **Статус:** проект работает только локально (Docker Desktop + Postgres на порту 5433, контейнер `moex_trading_db`). VPS временно отключён.
+- **GUI запущен:** `wails.exe` (PID 9220) + `moex-trader-gui-dev.exe` (PID 9584), порт 34115.
+- **Создан `moex-trader-gui/agent.env`:** конфигурация агента с оптимизированными параметрами для увеличения баланса:
+  - Комиссии Finam: 0.035% (акции), 0.45 ₽ (фьючерсы) — актуально на 2026-10-27
+  - Universe расширен: `AGENT_MIN_STOCK_NOTIONAL_RUB=1000`, `AGENT_MIN_TURNOVER_RUB=120000`, `AGENT_BUY_CANDIDATES_LIMIT=30`
+  - Open-bias усилен: `AGENT_OPEN_BUY_GATE_DELTA=0.06`, `AGENT_OPEN_MAX_BUY_ATTEMPTS_BONUS=5`
+  - Выходы: `AGENT_POSITION_TP_PCT=1.8`, `AGENT_POSITION_SL_PCT=1.0` (с учётом комиссий)
+  - Трейлинг: `AGENT_TRAILING_ACTIVATE_PCT=0.8`, `AGENT_TRAILING_STEP_PCT=0.5`
+  - Фьючерсы: `AGENT_AUTO_INSTRUMENT_MODE=auto/all`, `AGENT_FUTURES_ALLOWLIST_AUTO_LEARN=1`
+  - Risk: `AGENT_MAX_DAILY_NOTIONAL=1000000`, `AGENT_DAILY_NOTIONAL_TUNE_APPLY=1`
+  - Мия: `ONLINE_MIA_API_TICKERS` расширен до 15 тикеров (добавлены YNDX, AFKS, ALRS)
+- **Обновлён `CHAT_CONTEXT_PACKET.md`:** добавлены секции «Комиссии Finam», «Конфигурация агента», «Локальный режим».
+- **Обновлён `NEXT_STEPS.md`:** «Оперативный фокус **2026-10-27**» с описанием локального режима и оптимизации.
+- **Исправлена кодировка `CHAT_CONTEXT_PACKET.md`:** скрипт `build-chat-context.ps1` теперь использует явный UTF-8 (без BOM) через `[System.IO.File]::WriteAllText` с `UTF8Encoding $false`.
+- **`.gitignore` обновлён:** добавлен `agent.env` для безопасности.
+
+---
+
 ## 2026-09-04
 
 ### Публикация на GitHub (public `moex-muhlya`) — push выполнен

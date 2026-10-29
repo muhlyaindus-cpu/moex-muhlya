@@ -1,0 +1,42 @@
+CREATE TABLE IF NOT EXISTS market_data (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    time TIMESTAMPTZ NOT NULL,
+    open DECIMAL(20,4),
+    high DECIMAL(20,4),
+    low DECIMAL(20,4),
+    close DECIMAL(20,4),
+    volume BIGINT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS trades (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    quantity INTEGER NOT NULL,
+    price DECIMAL(20,2) NOT NULL,
+    status TEXT DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    executed_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS positions (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL UNIQUE,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    avg_price DECIMAL(20,2) DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS watchlist (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL UNIQUE,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id BIGSERIAL PRIMARY KEY,
+    at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    level TEXT NOT NULL,
+    step TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_created_at ON runtime_events(created_at DESC);
