@@ -17,6 +17,8 @@ export function GetAutoDecisionStatus():Promise<main.AutoDecisionStatus>;
 
 export function GetAutoInstrumentConfig():Promise<Record<string, string>>;
 
+export function GetBlockedTickers():Promise<Array<main.BlockedTicker>>;
+
 export function GetCurrentAccount():Promise<string>;
 
 export function GetCurrentPrice(arg1:string):Promise<number>;

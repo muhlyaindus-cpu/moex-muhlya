@@ -40,6 +40,22 @@ export namespace main {
 	        this.note = source["note"];
 	    }
 	}
+	export class BlockedTicker {
+	    ticker: string;
+	    reason: string;
+	    type: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new BlockedTicker(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ticker = source["ticker"];
+	        this.reason = source["reason"];
+	        this.type = source["type"];
+	    }
+	}
 	export class RuntimeEvent {
 	    at: string;
 	    level: string;
@@ -183,6 +199,8 @@ export namespace services {
 	    price: number;
 	    num_trades?: number;
 	    turnover_rub?: number;
+	    // Go type: time
+	    expiry_date?: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Security(source);
@@ -195,7 +213,26 @@ export namespace services {
 	        this.price = source["price"];
 	        this.num_trades = source["num_trades"];
 	        this.turnover_rub = source["turnover_rub"];
+	        this.expiry_date = this.convertValues(source["expiry_date"], null);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }

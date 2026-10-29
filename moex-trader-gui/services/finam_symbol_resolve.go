@@ -330,6 +330,8 @@ func (b *FinamBroker) rememberFinamFutureSymbolResolution(ticker, resolvedSymbol
 }
 
 // OrderSymbolForAPI возвращает полный символ для REST/WS (с учётом переопределений).
+// Для фьючерсов: извлекает базовый тикер из SHORTNAME (например, "MTSI-12.26" → "MTSI")
+// и ищет его в overrides файле.
 func (b *FinamBroker) OrderSymbolForAPI(ticker string) string {
 	key := brokerSymbolOverrideKey(ticker)
 	if key != "" && b.symbolOverrides != nil {
@@ -352,8 +354,41 @@ func (b *FinamBroker) OrderSymbolForAPI(ticker string) string {
 			return strings.TrimSpace(sym)
 		}
 		b.futuresIndexMu.RUnlock()
+		
+		// Дополнительная попытка: извлечь базовый тикер из SHORTNAME (если ticker — это SECID вроде "MTZ6")
+		// SHORTNAME имеет формат "BASETICKER-DATE" (например, "MTSI-12.26")
+		// Извлекаем BASETICKER и ищем его в overrides
+		if shortName := b.getShortNameForFutures(ticker); shortName != "" {
+			baseKey := normalizeFuturesMatchKey(extractBaseTickerFromShortName(shortName))
+			if baseKey != "" && b.symbolOverrides != nil {
+				if v, ok := b.symbolOverrides[baseKey]; ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
 	}
 	return b.formatSymbolForREST(ticker)
+}
+
+// getShortNameForFutures возвращает SHORTNAME для фьючерса (например, "MTSI-12.26" для "MTZ6")
+// Использует кэш SHORTNAME из MOEXClient, который заполняется при загрузке инструментов из MOEX ISS
+func (b *FinamBroker) getShortNameForFutures(ticker string) string {
+	if b.moexClient == nil {
+		return ""
+	}
+	return b.moexClient.GetShortName(ticker)
+}
+
+// extractBaseTickerFromShortName извлекает базовый тикер из SHORTNAME
+// Например: "MTSI-12.26" → "MTSI", "Si-6.25" → "Si"
+func extractBaseTickerFromShortName(shortName string) string {
+	// Ищем первый дефис или точку
+	for i, ch := range shortName {
+		if ch == '-' || ch == '.' {
+			return strings.TrimSpace(shortName[:i])
+		}
+	}
+	return strings.TrimSpace(shortName)
 }
 
 // ValidateFuturesSymbolForAccount — gRPC GetAsset: есть ли инструмент у счёта в Finam.

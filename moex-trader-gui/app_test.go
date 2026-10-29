@@ -4,7 +4,7 @@ import "testing"
 
 func TestAffordableQuantity_ReturnsZeroWhenInsufficientCash(t *testing.T) {
 	a := &App{}
-	qty := a.affordableQuantity(1000, 2000, 10, false)
+	qty := a.affordableQuantity(1000, 2000, 10, false, "TEST")
 	if qty != 0 {
 		t.Fatalf("expected 0 quantity, got %d", qty)
 	}
@@ -12,7 +12,7 @@ func TestAffordableQuantity_ReturnsZeroWhenInsufficientCash(t *testing.T) {
 
 func TestAffordableQuantity_CapsByCash(t *testing.T) {
 	a := &App{}
-	qty := a.affordableQuantity(10000, 1000, 20, false)
+	qty := a.affordableQuantity(10000, 1000, 20, false, "TEST")
 	if qty <= 0 || qty >= 20 {
 		t.Fatalf("expected capped positive quantity (<20), got %d", qty)
 	}

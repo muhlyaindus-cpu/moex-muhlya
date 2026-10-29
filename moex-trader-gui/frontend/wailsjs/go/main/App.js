@@ -30,6 +30,10 @@ export function GetAutoInstrumentConfig() {
   return window['go']['main']['App']['GetAutoInstrumentConfig']();
 }
 
+export function GetBlockedTickers() {
+  return window['go']['main']['App']['GetBlockedTickers']();
+}
+
 export function GetCurrentAccount() {
   return window['go']['main']['App']['GetCurrentAccount']();
 }

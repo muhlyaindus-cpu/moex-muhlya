@@ -46,19 +46,21 @@ Generated: $generatedNsk (NSK, UTC+7)
 
 "@
 
-Set-Content -Path $outPath -Value $header -Encoding UTF8
+# Записываем header с UTF-8 (без BOM)
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($outPath, $header, $utf8NoBom)
 
 $stylePath = Join-Path $root $styleFile
 if (Test-Path $stylePath) {
-    Add-Content -Path $outPath -Value "`n---`n`n## FILE: $styleFile`n"
-    Get-Content $stylePath | Add-Content -Path $outPath
+    $content = [System.IO.File]::ReadAllText($stylePath, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::AppendAllText($outPath, "`n---`n`n## FILE: $styleFile`n`n$content", $utf8NoBom)
 }
 
 foreach ($f in $files) {
     $path = Join-Path $root $f
     if (Test-Path $path) {
-        Add-Content -Path $outPath -Value "`n---`n`n## FILE: $f`n"
-        Get-Content $path | Add-Content -Path $outPath
+        $content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::AppendAllText($outPath, "`n---`n`n## FILE: $f`n`n$content", $utf8NoBom)
     }
 }
 

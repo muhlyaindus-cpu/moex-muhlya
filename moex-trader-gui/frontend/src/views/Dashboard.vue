@@ -355,7 +355,13 @@
             </td>
             <td>
               <button class="sltp" type="button" @click="placeSLTPBracket(pos)">SL/TP</button>
-              <button class="sell" @click="quickSell(pos.ticker, pos.quantity, pos.current_price)">Sell</button>
+              <button 
+                class="close-position" 
+                :class="pos.quantity > 0 ? 'close-long' : 'close-short'"
+                @click="closePosition(pos.ticker, pos.quantity, pos.current_price)"
+              >
+                {{ pos.quantity > 0 ? 'Закрыть Long' : 'Закрыть Short' }}
+              </button>
             </td>
           </tr>
         </tbody>
@@ -465,6 +471,38 @@
         </tbody>
       </table>
     </div>
+
+    <div class="portfolio">
+      <div class="section-header">
+        <h2>🚫 Заблокированные бумаги</h2>
+        <div class="runtime-controls">
+          <button class="collapse-btn runtime-refresh-btn" type="button" @click="loadBlockedTickers">
+            ↻
+          </button>
+        </div>
+      </div>
+      <div v-if="blockedTickers.length === 0" class="loading">Нет заблокированных бумаг</div>
+      <table v-else>
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Тип</th>
+            <th>Причина блокировки</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="t in blockedTickers" :key="t.ticker">
+            <td class="ticker">{{ t.ticker }}</td>
+            <td>
+              <span class="trade-status" :class="t.type === 'futures' ? 'kind-info' : 'kind-warn'">
+                {{ t.type === 'futures' ? 'Фьючерс' : 'Акция' }}
+              </span>
+            </td>
+            <td class="trade-reason" :title="t.reason">{{ t.reason }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 
@@ -478,15 +516,15 @@ import {
   formatDateTimeNskMsk,
   formatClockNskMsk
 } from '../utils/time'
-import { 
+import {
   GetWatchlist,
   GetStockInstruments,
-  GetPortfolio, 
-  GetStatistics, 
-  GetAgentStatus, 
-  SetAgentActive, 
-  AnalyzeWithAgent, 
-  BuyPosition, 
+  GetPortfolio,
+  GetStatistics,
+  GetAgentStatus,
+  SetAgentActive,
+  AnalyzeWithAgent,
+  BuyPosition,
   SellPosition,
   GetAccounts,
   SwitchAccount,
@@ -511,7 +549,8 @@ import {
   SetAutoBudgetPercent,
   SetAutoTPSLPercent,
   SetAutoProfitLockPercent,
-  ResetAutoContextSoft
+  ResetAutoContextSoft,
+  GetBlockedTickers
 } from '../../wailsjs/go/main/App'
 
 interface Security {
@@ -566,6 +605,12 @@ interface RuntimeEvent {
   details: string
 }
 
+interface BlockedTicker {
+  ticker: string
+  reason: string
+  type: string
+}
+
 interface AutoDecisionStatus {
   at: string
   universe_size: number
@@ -612,6 +657,7 @@ const tradeJournal = ref<TradeJournalEntry[]>([])
 const runtimeEvents = ref<RuntimeEvent[]>([])
 const runtimeEventsSource = ref<'db' | 'memory'>('db')
 const runtimeEventsLimit = ref(50)
+const blockedTickers = ref<BlockedTicker[]>([])
 const autoDecision = ref<AutoDecisionStatus | null>(null)
 const issuerCache = ref<Record<string, string>>({})
 const autoInstrumentMode = ref<'auto' | 'stocks' | 'futures' | 'options' | 'fixed'>('auto')
@@ -919,6 +965,15 @@ async function loadRuntimeEvents() {
   runtimeEvents.value = await GetRuntimeEvents(limit)
 }
 
+async function loadBlockedTickers() {
+  try {
+    blockedTickers.value = await GetBlockedTickers()
+  } catch (e) {
+    console.error('Failed to load blocked tickers:', e)
+    blockedTickers.value = []
+  }
+}
+
 function loadWatchlistCollapseState() {
   try {
     const stocksSaved = localStorage.getItem(stocksCollapseStorageKey)
@@ -1027,6 +1082,35 @@ async function quickSell(ticker: string, maxQuantity: number, price: number) {
     } else {
       alert('Sell failed')
     }
+  }
+}
+
+// closePosition закрывает позицию (long или short)
+async function closePosition(ticker: string, quantity: number, price: number) {
+  const absQuantity = Math.abs(quantity)
+  const isLong = quantity > 0
+  
+  const confirmMsg = isLong 
+    ? `Закрыть LONG ${ticker} (${absQuantity} шт) по цене ${price}?`
+    : `Закрыть SHORT ${ticker} (${absQuantity} шт) по цене ${price}?`
+  
+  if (!confirm(confirmMsg)) {
+    return
+  }
+  
+  let success = false
+  if (isLong) {
+    // Закрытие long — продаём
+    success = await SellPosition(ticker, absQuantity, price)
+  } else {
+    // Закрытие short — покупаем
+    success = await BuyPosition(ticker, absQuantity, price)
+  }
+  
+  if (success) {
+    loadData()
+  } else {
+    alert(isLong ? 'Failed to close long position' : 'Failed to close short position')
   }
 }
 
@@ -1367,6 +1451,7 @@ onMounted(() => {
   loadWatchlistCollapseState()
   loadAccounts()
   loadData()
+  loadBlockedTickers()
   const interval = setInterval(loadData, 10000)
   onUnmounted(() => clearInterval(interval))
 })
@@ -2121,6 +2206,26 @@ button.buy {
 
 button.sell {
   background: #ff4444;
+  color: white;
+}
+
+button.close-position {
+  padding: 4px 12px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  margin: 0 4px;
+  font-weight: 600;
+}
+
+button.close-long {
+  background: #ff9500;
+  color: white;
+}
+
+button.close-short {
+  background: #9500ff;
   color: white;
 }
 
