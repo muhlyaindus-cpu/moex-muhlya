@@ -348,6 +348,62 @@ func (c *MOEXClient) EnrichWithAnalytics(items []MarketSnapshotItem) {
 	}
 }
 
+// MarketRegime — состояние рынка для Мии-стратега.
+type MarketRegime struct {
+	IMOEX        float64 // индекс МосБиржи
+	IMOEXChange  float64 // изменение IMOEX за день (%)
+	Volatility   float64 // волатильность рынка (прокси)
+	MarketBreadth float64 // % растущих тикеров (up_ratio)
+}
+
+// GetMarketRegime возвращает состояние рынка: IMOEX, изменение, волатильность.
+func (c *MOEXClient) GetMarketRegime() MarketRegime {
+	regime := MarketRegime{}
+
+	// Получаем IMOEX
+	url := fmt.Sprintf("%s/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE", c.baseURL)
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return regime
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return regime
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return regime
+	}
+
+	mdBlock, _ := result["marketdata"].(map[string]interface{})
+	if mdBlock == nil {
+		return regime
+	}
+	cols, _ := mdBlock["columns"].([]interface{})
+	data, _ := mdBlock["data"].([]interface{})
+	if len(cols) == 0 || len(data) == 0 {
+		return regime
+	}
+
+	lastIdx := findColumnIndex(cols, "LAST")
+	changeIdx := findColumnIndex(cols, "CHANGE")
+
+	for _, rowAny := range data {
+		row, _ := rowAny.([]interface{})
+		if lastIdx >= 0 && lastIdx < len(row) {
+			regime.IMOEX = moexToFloat(row[lastIdx])
+		}
+		if changeIdx >= 0 && changeIdx < len(row) {
+			regime.IMOEXChange = moexToFloat(row[changeIdx])
+		}
+	}
+
+	return regime
+}
+
 func tradingStatusFromMarketdataBlock(marketdata map[string]interface{}) (string, error) {
 	colsAny, ok := marketdata["columns"].([]interface{})
 	if !ok {

@@ -278,6 +278,17 @@ type MiyaRecommendation struct {
 	Reason string  `json:"reason"` // краткое объяснение
 }
 
+// TradingMode — режим торговли, определяемый Мией-стратегом.
+type TradingMode struct {
+	Mode           string  `json:"mode"`             // "aggressive", "normal", "conservative", "pause"
+	TPMultiplier   float64 `json:"tp_multiplier"`    // множитель TP (1.0 = базовый)
+	SLMultiplier   float64 `json:"sl_multiplier"`    // множитель SL
+	SizeMultiplier float64 `json:"size_multiplier"`  // множитель размера позиции (0.5 = половина)
+	Reason         string  `json:"reason"`           // почему такой режим
+	IMOEX          float64 `json:"imoex"`            // индекс МосБиржи
+	IMOEXChange    float64 `json:"imoex_change"`     // изменение IMOEX (%)
+}
+
 type miyaOnlineSignal struct {
 	State            string
 	DataStatus       string
@@ -299,6 +310,8 @@ type miyaOnlineSignal struct {
 	// Расширенная аналитика
 	TrendBullCount int     // кол-во тикеров в бычьем тренде
 	RSIAverage     float64 // средний RSI по всем тикерам
+	// Режим торговли (Мия-стратег)
+	TradingMode TradingMode
 }
 
 func normalizeMiyaLiquidityStatus(raw string) string {
@@ -3004,6 +3017,15 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	if rsiCount > 0 {
 		rsiAvg = rsiSum / float64(rsiCount)
 	}
+
+	// === МИЯ-СТРАТЕГ: определение режима торговли ===
+	marketRegime := a.moex.GetMarketRegime()
+	marketRegime.MarketBreadth = upRatioPct
+	tradingMode := a.determineTradingMode(marketRegime, upRatioPct, trendBullPct)
+	a.addRuntimeEvent("info", "miya.strategist", fmt.Sprintf("mode=%s imoex=%.0f(%.2f%%) up=%.1f%% tp_x%.1f sl_x%.1f size_x%.1f | %s",
+		tradingMode.Mode, tradingMode.IMOEX, tradingMode.IMOEXChange, upRatioPct,
+		tradingMode.TPMultiplier, tradingMode.SLMultiplier, tradingMode.SizeMultiplier, tradingMode.Reason))
+
 	a.addRuntimeEvent("info", "miya.analytics", fmt.Sprintf("tickers=%d up=%.1f%% trend_bull=%d rsi_avg=%.0f rsi_oversold=%d rsi_overbought=%d state=%s",
 		totalCount, upRatioPct, trendBullCount, rsiAvg, rsiOversold, rsiOverbought, state))
 
@@ -3040,11 +3062,59 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 		Recommendations:  recommendations,
 		TrendBullCount:   trendBullCount,
 		RSIAverage:       math.Round(rsiAvg*10) / 10,
+		TradingMode:      tradingMode,
 	}
 
 	a.miyaOnlineSignalMu.Lock()
 	a.miyaOnlineSignal = next
 	a.miyaOnlineSignalMu.Unlock()
+}
+
+// determineTradingMode определяет режим торговли на основе состояния рынка.
+// Мия-стратег анализирует IMOEX, breadth, тренд и выдаёт рекомендации Мухле.
+func (a *App) determineTradingMode(regime services.MarketRegime, upRatioPct, trendBullPct float64) TradingMode {
+	mode := TradingMode{
+		IMOEX:       regime.IMOEX,
+		IMOEXChange: regime.IMOEXChange,
+	}
+
+	// PAUSE: кризис — рынок падает более 3%, большинство тикеров падают
+	if regime.IMOEXChange < -3.0 && upRatioPct < 15 {
+		mode.Mode = "pause"
+		mode.TPMultiplier = 0.0
+		mode.SLMultiplier = 0.5
+		mode.SizeMultiplier = 0.0
+		mode.Reason = fmt.Sprintf("Кризис: IMOEX %.1f%%, up %.0f%%", regime.IMOEXChange, upRatioPct)
+		return mode
+	}
+
+	// CONSERVATIVE: рынок падает или неопределённость
+	if regime.IMOEXChange < -1.0 || upRatioPct < 30 {
+		mode.Mode = "conservative"
+		mode.TPMultiplier = 0.8
+		mode.SLMultiplier = 0.6
+		mode.SizeMultiplier = 0.5
+		mode.Reason = fmt.Sprintf("Рынок слаб: IMOEX %.1f%%, up %.0f%%", regime.IMOEXChange, upRatioPct)
+		return mode
+	}
+
+	// AGGRESSIVE: рынок растёт, большинство тикеров в бычьем тренде
+	if regime.IMOEXChange > 1.0 && upRatioPct > 60 && trendBullPct > 60 {
+		mode.Mode = "aggressive"
+		mode.TPMultiplier = 1.5
+		mode.SLMultiplier = 1.0
+		mode.SizeMultiplier = 1.0
+		mode.Reason = fmt.Sprintf("Рынок силён: IMOEX +%.1f%%, up %.0f%%, trend %.0f%%", regime.IMOEXChange, upRatioPct, trendBullPct)
+		return mode
+	}
+
+	// NORMAL: обычная ситуация
+	mode.Mode = "normal"
+	mode.TPMultiplier = 1.0
+	mode.SLMultiplier = 1.0
+	mode.SizeMultiplier = 1.0
+	mode.Reason = fmt.Sprintf("Рынок стабилен: IMOEX %.1f%%, up %.0f%%", regime.IMOEXChange, upRatioPct)
+	return mode
 }
 
 func (a *App) getMiyaOnlineSignal(now time.Time) miyaOnlineSignal {
