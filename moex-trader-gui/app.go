@@ -3437,6 +3437,14 @@ func (a *App) autoLoop(ctx context.Context) {
 	if miyaRecWeight > 0.30 {
 		miyaRecWeight = 0.30
 	}
+	// Бонус к conf за рекомендации Мии (score 0-100 → бонус к confidence)
+	miyaRecConfBonus := envFloat("AGENT_MIA_RECOMMENDATION_CONF_BONUS", 0.12)
+	if miyaRecConfBonus < 0 {
+		miyaRecConfBonus = 0
+	}
+	if miyaRecConfBonus > 0.25 {
+		miyaRecConfBonus = 0.25
+	}
 	shortOpenEnabled := envBool("AGENT_SHORT_OPEN_ENABLED", true)
 	dailyNotionalTuneEnabled := envBool("AGENT_DAILY_NOTIONAL_TUNE_ENABLED", true)
 	dailyNotionalTuneApply := envBool("AGENT_DAILY_NOTIONAL_TUNE_APPLY", false)
@@ -4300,6 +4308,12 @@ func (a *App) autoLoop(ctx context.Context) {
 				}
 				conf += a.rejectPenaltyScore(rejectStats[s.Ticker])
 				conf += profile.ConfDelta
+				// Бонус к conf за рекомендации Мии (топ-N тикеров)
+				if miyaRecConfBonus > 0 {
+					if recScore, ok := miyaRecScores[canonicalTickerKey(s.Ticker)]; ok && recScore > 0 {
+						conf += recScore / 100.0 * miyaRecConfBonus
+					}
+				}
 				if conf < 0 {
 					conf = 0
 				}
@@ -4323,6 +4337,11 @@ func (a *App) autoLoop(ctx context.Context) {
 					qty = lot
 				}
 				if have := posMap[s.Ticker].Qty; have > 0 {
+					// Анти-зацикливание: штраф за повторные покупки того же тикера
+					conf -= 0.15 // снижаем conf, чтобы Мухля искал другие тикеры
+					if conf < 0 {
+						conf = 0
+					}
 					if conf < weakLongConf {
 						weakLongTicker = s.Ticker
 						weakLongQty = have
