@@ -360,8 +360,9 @@ type MarketRegime struct {
 func (c *MOEXClient) GetMarketRegime() MarketRegime {
 	regime := MarketRegime{}
 
-	// Получаем IMOEX
-	url := fmt.Sprintf("%s/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE", c.baseURL)
+	// Получаем IMOEX (индекс МосБиржи)
+	// Для индексов MOEX ISS использует LASTVALUE и LASTCHANGE (не LAST/CHANGE)
+	url := fmt.Sprintf("%s/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&marketdata.columns=SECID,LASTVALUE,LASTCHANGE,LASTCHANGEPRC", c.baseURL)
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
 		return regime
@@ -388,15 +389,18 @@ func (c *MOEXClient) GetMarketRegime() MarketRegime {
 		return regime
 	}
 
-	lastIdx := findColumnIndex(cols, "LAST")
-	changeIdx := findColumnIndex(cols, "CHANGE")
+	lastIdx := findColumnIndex(cols, "LASTVALUE")
+	changeIdx := findColumnIndex(cols, "LASTCHANGE")
+	changePctIdx := findColumnIndex(cols, "LASTCHANGEPRC")
 
 	for _, rowAny := range data {
 		row, _ := rowAny.([]interface{})
 		if lastIdx >= 0 && lastIdx < len(row) {
 			regime.IMOEX = moexToFloat(row[lastIdx])
 		}
-		if changeIdx >= 0 && changeIdx < len(row) {
+		if changePctIdx >= 0 && changePctIdx < len(row) {
+			regime.IMOEXChange = moexToFloat(row[changePctIdx])
+		} else if changeIdx >= 0 && changeIdx < len(row) {
 			regime.IMOEXChange = moexToFloat(row[changeIdx])
 		}
 	}
