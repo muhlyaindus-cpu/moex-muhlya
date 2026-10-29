@@ -4875,11 +4875,18 @@ func (a *App) autoLoop(ctx context.Context) {
 						if cand.Conf < candGate {
 							continue
 						}
-						if ok, note := a.mtfConfirm(cand.Ticker, "buy"); !ok {
-							a.addRuntimeEvent("warn", "auto.skip_mtf_buy", fmt.Sprintf("%s %s", cand.Ticker, note))
-							a.rememberRecentAutoTicker(cand.Ticker, 60*time.Second)
-							blockedByRotation++
-							continue
+						// Пропускаем MTF для тикеров с высоким score от Мии (score > 90)
+						miyaSkipMTF := false
+						if recScore, ok := miyaRecScores[canonicalTickerKey(cand.Ticker)]; ok && recScore > 90 {
+							miyaSkipMTF = true
+						}
+						if !miyaSkipMTF {
+							if ok, note := a.mtfConfirm(cand.Ticker, "buy"); !ok {
+								a.addRuntimeEvent("warn", "auto.skip_mtf_buy", fmt.Sprintf("%s %s", cand.Ticker, note))
+								a.rememberRecentAutoTicker(cand.Ticker, 60*time.Second)
+								blockedByRotation++
+								continue
+							}
 						}
 						qty := cand.Qty
 						if qty <= 0 {
