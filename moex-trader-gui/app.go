@@ -2086,6 +2086,33 @@ func (a *App) isPendingBuyGateStale(pending map[string]string, staleAfter time.D
 	return age >= staleAfter, age
 }
 
+// cancelStalePendingOrdersInLoop отменяет зависшие pending ордера в автоцикле.
+// Если ордер висит дольше maxAge, отменяем его через брокера.
+func (a *App) cancelStalePendingOrdersInLoop(maxAge time.Duration) {
+	if a.broker == nil || maxAge <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	orders, err := a.broker.GetOrders(ctx)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, o := range orders {
+		if isTerminalOrderStatus(o.Status) {
+			continue
+		}
+		if !o.CreatedAt.IsZero() && now.Sub(o.CreatedAt) > maxAge {
+			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := a.broker.CancelOrder(cancelCtx, o.ID); err == nil {
+				a.addRuntimeEvent("warn", "auto.cancelled_stale_order", fmt.Sprintf("order_id=%s ticker=%s age=%s side=%s", o.ID, o.Ticker, now.Sub(o.CreatedAt).Round(time.Second), o.Side))
+			}
+			cancelFn()
+		}
+	}
+}
+
 func (a *App) nowInTradingTZ() time.Time {
 	if a.tradingLocation == nil {
 		return time.Now()
@@ -3868,6 +3895,12 @@ func (a *App) autoLoop(ctx context.Context) {
 			if autoBudgetBal <= 0 {
 				autoBudgetBal = bal
 			}
+			// Применяем множитель размера от Мии-стратега
+			if miyaOnlineHintsEnabled && miyaSig.TradingMode.SizeMultiplier > 0 && miyaSig.TradingMode.SizeMultiplier <= 1.0 {
+				autoBudgetBal *= miyaSig.TradingMode.SizeMultiplier
+			}
+			// Режим PAUSE — не открываем новые позиции
+			miyaPauseMode := miyaOnlineHintsEnabled && miyaSig.TradingMode.Mode == "pause"
 
 			// Снимок портфеля, чтобы не покупать бесконечно (один запрос к брокеру на цикл).
 			portfolio := a.GetPortfolio()
@@ -3968,9 +4001,20 @@ func (a *App) autoLoop(ctx context.Context) {
 				shortOpenConfGate = buyConfGate
 			}
 			triggerCfg, trailCfg := a.getAutoProfitLockPercent()
+			// Применяем множители Мии-стратега к TP/SL
+			miyaTP := tpPct
+			miyaSL := slPct
+			if miyaOnlineHintsEnabled && miyaSig.TradingMode.Mode != "" {
+				if miyaSig.TradingMode.TPMultiplier > 0 {
+					miyaTP = tpPct * miyaSig.TradingMode.TPMultiplier
+				}
+				if miyaSig.TradingMode.SLMultiplier > 0 {
+					miyaSL = slPct * miyaSig.TradingMode.SLMultiplier
+				}
+			}
 			exitProfile := a.resolveExitProfile(
-				tpPct,
-				slPct,
+				miyaTP,
+				miyaSL,
 				triggerCfg/100.0,
 				trailCfg/100.0,
 				staleBand,
@@ -4871,7 +4915,9 @@ func (a *App) autoLoop(ctx context.Context) {
 			}
 
 			// Приоритет №3: покупка (открытие long / закрытие short).
-			if placed < maxOrdersThisCycle && len(buyCandidates) > 0 {
+			if !miyaPauseMode && placed < maxOrdersThisCycle && len(buyCandidates) > 0 {
+				// Автоотмена зависших pending ордеров (висят > 10 минут)
+				a.cancelStalePendingOrdersInLoop(10 * time.Minute)
 				// Снимок pending-buy заявок на весь цикл: не дёргаем брокера на каждый кандидат.
 				pendingBuy := a.pendingOrderTickerSet("buy")
 				pendingLogged := make(map[string]struct{})
