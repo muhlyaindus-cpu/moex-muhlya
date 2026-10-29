@@ -238,7 +238,7 @@ type MarketSnapshotItem struct {
 	Last          float64
 	Change        float64
 	TurnoverRub   float64
-	TradingStatus int
+	TradingActive bool // true если торги идут (TRADINGSTATUS = "T" или 2)
 }
 
 // GetMarketSnapshot возвращает LAST, CHANGE, VALTODAY, TRADINGSTATUS для списка тикеров (акции TQBR).
@@ -296,7 +296,17 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 				item.TurnoverRub = moexToFloat(row[valIdx])
 			}
 			if statusIdx >= 0 && statusIdx < len(row) {
-				item.TradingStatus = int(moexToFloat(row[statusIdx]))
+				// TRADINGSTATUS может быть строкой "T" (торги идут) или числом 2
+				statusVal := row[statusIdx]
+				switch v := statusVal.(type) {
+				case string:
+					item.TradingActive = (v == "T" || v == "2")
+				case float64:
+					item.TradingActive = (v == 2)
+				default:
+					s := fmt.Sprintf("%v", statusVal)
+					item.TradingActive = (s == "T" || s == "2")
+				}
 			}
 			result = append(result, item)
 		}

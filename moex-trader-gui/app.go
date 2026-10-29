@@ -2825,8 +2825,8 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	liquidityData := make([]liqEntry, 0, len(snapshot))
 
 	for _, item := range snapshot {
-		// TRADINGSTATUS=2 означает активные торги
-		if item.TradingStatus != 2 {
+		// TradingActive = true если торги идут (TRADINGSTATUS = "T" или 2)
+		if !item.TradingActive {
 			continue
 		}
 		totalCount++
