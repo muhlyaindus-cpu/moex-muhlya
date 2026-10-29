@@ -330,6 +330,24 @@ func miyaLiquidityRankBonus(ticker string, rank map[string]int, n int, status st
 	return weight * float64(n-r+1) / float64(n)
 }
 
+// miyaRecommendationBonus возвращает бонус к rankScore для тикеров из рекомендаций Мии.
+// Score 0-100 нормализуется в бонус 0-weight.
+func miyaRecommendationBonus(ticker string, recScores map[string]float64, weight float64) float64 {
+	if weight <= 0 || len(recScores) == 0 {
+		return 0
+	}
+	k := canonicalTickerKey(ticker)
+	if k == "" {
+		return 0
+	}
+	score, ok := recScores[k]
+	if !ok || score <= 0 {
+		return 0
+	}
+	// Нормализуем score (0-100) в бонус (0-weight)
+	return weight * score / 100.0
+}
+
 func miyaOnlineGateDeltas(state string, defaultMul float64, buyMaxDelta float64, shortMaxDelta float64) (float64, float64) {
 	state = normalizeMiyaOnlineState(state)
 	strength := clampFloat(absFloat(defaultMul-1.0)*20.0, 0.25, 1.0)
@@ -3378,6 +3396,14 @@ func (a *App) autoLoop(ctx context.Context) {
 	if miyaLiqRankWeight > 0.08 {
 		miyaLiqRankWeight = 0.08
 	}
+	// Бонус за рекомендации Мии (score 0-100 → бонус к rankScore)
+	miyaRecWeight := envFloat("AGENT_MIA_RECOMMENDATION_WEIGHT", 0.15)
+	if miyaRecWeight < 0 {
+		miyaRecWeight = 0
+	}
+	if miyaRecWeight > 0.30 {
+		miyaRecWeight = 0.30
+	}
 	shortOpenEnabled := envBool("AGENT_SHORT_OPEN_ENABLED", true)
 	dailyNotionalTuneEnabled := envBool("AGENT_DAILY_NOTIONAL_TUNE_ENABLED", true)
 	dailyNotionalTuneApply := envBool("AGENT_DAILY_NOTIONAL_TUNE_APPLY", false)
@@ -3584,6 +3610,14 @@ func (a *App) autoLoop(ctx context.Context) {
 				k := canonicalTickerKey(t)
 				if k != "" {
 					miyaLiqRank[k] = i + 1
+				}
+			}
+			// Рекомендации Мии: тикер → score (0-100)
+			miyaRecScores := map[string]float64{}
+			for _, rec := range miyaSig.Recommendations {
+				k := canonicalTickerKey(rec.Ticker)
+				if k != "" {
+					miyaRecScores[k] = rec.Score
 				}
 			}
 			miyaWatchSet := map[string]struct{}{}
@@ -4308,6 +4342,8 @@ func (a *App) autoLoop(ctx context.Context) {
 					if miyaLiqRankEnabled && !isFuturesTicker {
 						liqBonus = miyaLiquidityRankBonus(s.Ticker, miyaLiqRank, miyaLiqN, miyaSig.LiquidityStatus, miyaLiqRankWeight)
 					}
+					// Бонус за рекомендации Мии (топ-N тикеров с высоким score)
+					recBonus := miyaRecommendationBonus(s.Ticker, miyaRecScores, miyaRecWeight)
 					candGate := buyConfGate + profile.BuyGateOffset
 					expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 					roundTripCostPct := stockRoundTripCostPct
@@ -4315,7 +4351,7 @@ func (a *App) autoLoop(ctx context.Context) {
 						roundTripCostPct = futuresRoundTripCostPct
 					}
 					expectedProfitScore := expectedEdge*expectedProfitWeight - roundTripCostPct*expectedProfitCostScale
-					rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + expectedProfitScore
+					rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + recBonus + expectedProfitScore
 					// Бонус для фьючерсов: +0.10 к rankScore, чтобы они чаще попадали в топ-кандидатов
 					if isFuturesTicker {
 						rankScore += 0.10
@@ -4484,6 +4520,7 @@ func (a *App) autoLoop(ctx context.Context) {
 						if miyaLiqRankEnabled && !isFuturesTicker {
 							liqBonus = miyaLiquidityRankBonus(s.Ticker, miyaLiqRank, miyaLiqN, miyaSig.LiquidityStatus, miyaLiqRankWeight)
 						}
+						recBonus := miyaRecommendationBonus(s.Ticker, miyaRecScores, miyaRecWeight)
 						candGate := buyConfGate + profile.BuyGateOffset
 						expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 						roundTripCostPct := stockRoundTripCostPct
@@ -4491,7 +4528,7 @@ func (a *App) autoLoop(ctx context.Context) {
 							roundTripCostPct = futuresRoundTripCostPct
 						}
 						expectedProfitScore := expectedEdge*expectedProfitWeight - roundTripCostPct*expectedProfitCostScale
-						rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + expectedProfitScore
+						rankScore := conf + execRatio*affordabilityScoreWeight + profile.RankScoreDelta + liqBonus + recBonus + expectedProfitScore
 						// Бонус для фьючерсов: +0.10 к rankScore, чтобы они чаще попадали в топ-кандидатов
 						if isFuturesTicker {
 							rankScore += 0.10
