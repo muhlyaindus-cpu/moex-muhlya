@@ -3262,9 +3262,42 @@ func (a *App) StartAutoTrading() bool {
 	a.autoStop = cancel
 	a.autoAlive = true
 
+	// Автоотмена зависших pending buy ордеров при старте
+	a.cancelStalePendingBuyOrders(ctx, 5*time.Minute)
+
 	go a.autoLoop(ctx)
 	a.addRuntimeEvent("info", "auto.started", "autotrading loop started")
 	return true
+}
+
+// cancelStalePendingBuyOrders отменяет все pending buy ордера, висящие дольше staleAfter.
+func (a *App) cancelStalePendingBuyOrders(ctx context.Context, staleAfter time.Duration) {
+	if a.broker == nil {
+		return
+	}
+	orders, err := a.broker.GetOrders(ctx)
+	if err != nil {
+		return
+	}
+	cancelled := 0
+	for _, o := range orders {
+		if isTerminalOrderStatus(o.Status) {
+			continue
+		}
+		if !strings.EqualFold(o.Side, "buy") && o.Side != "SIDE_BUY" {
+			continue
+		}
+		// Отменяем все pending buy ордера при старте (они могут зависнуть)
+		cancelCtx, cancelFn := context.WithTimeout(ctx, 5*time.Second)
+		if err := a.broker.CancelOrder(cancelCtx, o.ID); err == nil {
+			cancelled++
+			a.addRuntimeEvent("info", "auto.cancelled_stale_pending", fmt.Sprintf("order_id=%s ticker=%s", o.ID, o.Ticker))
+		}
+		cancelFn()
+	}
+	if cancelled > 0 {
+		a.addRuntimeEvent("info", "auto.stale_pending_cleaned", fmt.Sprintf("cancelled=%d", cancelled))
+	}
 }
 
 // SetAutoInstrumentConfig задаёт режим выбора инструмента в автоторговле.
