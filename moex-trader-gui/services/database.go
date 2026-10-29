@@ -117,6 +117,22 @@ ORDER BY ticker
 	return positions, nil
 }
 
+// ClearPositions удаляет все позиции из БД
+func (p *PostgresDB) ClearPositions() error {
+	_, err := p.db.Exec("DELETE FROM positions")
+	return err
+}
+
+// UpsertPosition вставляет или обновляет позицию
+func (p *PostgresDB) UpsertPosition(ticker string, quantity int, avgPrice float64) error {
+	query := `INSERT INTO positions (ticker, quantity, avg_price, updated_at) 
+	          VALUES ($1, $2, $3, NOW())
+	          ON CONFLICT (ticker) 
+	          DO UPDATE SET quantity = $2, avg_price = $3, updated_at = NOW()`
+	_, err := p.db.Exec(query, ticker, quantity, avgPrice)
+	return err
+}
+
 func (p *PostgresDB) BuyPosition(ticker string, quantity int, price float64) bool {
 	tx, err := p.db.Begin()
 	if err != nil {
