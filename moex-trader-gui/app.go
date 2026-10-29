@@ -269,6 +269,15 @@ type exitLearningStore struct {
 	Tickers   map[string]tickerExitLearning `json:"tickers"`
 }
 
+// MiyaRecommendation — рекомендация Мии для конкретного тикера.
+type MiyaRecommendation struct {
+	Ticker string  `json:"ticker"`
+	Score  float64 `json:"score"`  // 0-100, выше = лучше
+	RSI    float64 `json:"rsi"`    // RSI(14)
+	Trend  string  `json:"trend"`  // "bull" или "bear"
+	Reason string  `json:"reason"` // краткое объяснение
+}
+
 type miyaOnlineSignal struct {
 	State            string
 	DataStatus       string
@@ -285,6 +294,11 @@ type miyaOnlineSignal struct {
 	LiquidityStatus string
 	// Список «подготовки» Мии (тот же, что ONLINE_MIA_API_TICKERS); MIYA_WATCH_TICKERS в miya_online_signal.env
 	WatchTickers []string
+	// Рекомендации Мии — топ-N тикеров для покупки (отсортированы по score)
+	Recommendations []MiyaRecommendation
+	// Расширенная аналитика
+	TrendBullCount int     // кол-во тикеров в бычьем тренде
+	RSIAverage     float64 // средний RSI по всем тикерам
 }
 
 func normalizeMiyaLiquidityStatus(raw string) string {
@@ -2824,14 +2838,18 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	trendBullCount := 0
 	rsiOversold := 0  // RSI < 30
 	rsiOverbought := 0 // RSI > 70
+	rsiSum := 0.0
+	rsiCount := 0
 	type liqEntry struct {
 		ticker   string
 		turnover float64
 	}
 	liquidityData := make([]liqEntry, 0, len(snapshot))
+	recommendations := make([]MiyaRecommendation, 0, len(snapshot))
+	maxTurnover := 0.0
 
+	// Первый проход: собираем данные и находим макс. ликвидность
 	for _, item := range snapshot {
-		// TradingActive = true если торги идут (TRADINGSTATUS = "T" или 2)
 		if !item.TradingActive {
 			continue
 		}
@@ -2843,6 +2861,8 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 			trendBullCount++
 		}
 		if item.RSI14 > 0 {
+			rsiSum += item.RSI14
+			rsiCount++
 			if item.RSI14 < 30 {
 				rsiOversold++
 			} else if item.RSI14 > 70 {
@@ -2850,6 +2870,91 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 			}
 		}
 		liquidityData = append(liquidityData, liqEntry{item.Ticker, item.TurnoverRub})
+		if item.TurnoverRub > maxTurnover {
+			maxTurnover = item.TurnoverRub
+		}
+	}
+
+	// Второй проход: вычисляем score и формируем рекомендации
+	for _, item := range snapshot {
+		if !item.TradingActive {
+			continue
+		}
+		score := 50.0 // базовый score
+		reasons := make([]string, 0, 4)
+
+		// RSI: перепроданный = хорошо для покупки, перекупленный = плохо
+		if item.RSI14 > 0 {
+			if item.RSI14 < 30 {
+				score += 25
+				reasons = append(reasons, fmt.Sprintf("RSI=%.0f(перепродан)", item.RSI14))
+			} else if item.RSI14 < 50 {
+				score += 15
+				reasons = append(reasons, fmt.Sprintf("RSI=%.0f(низкий)", item.RSI14))
+			} else if item.RSI14 > 70 {
+				score -= 20
+				reasons = append(reasons, fmt.Sprintf("RSI=%.0f(перекуплен)", item.RSI14))
+			}
+		}
+
+		// Тренд: бычий = хорошо
+		if item.TrendBull {
+			score += 20
+			reasons = append(reasons, "тренд↑")
+		} else {
+			score -= 10
+			reasons = append(reasons, "тренд↓")
+		}
+
+		// Ликвидность: более ликвидные предпочтительнее
+		if maxTurnover > 0 {
+			liqScore := (item.TurnoverRub / maxTurnover) * 15
+			score += liqScore
+		}
+
+		// Дневное изменение: небольшое падение = возможность входа
+		if item.Change > 0 && item.Change < 2 {
+			score += 5
+			reasons = append(reasons, fmt.Sprintf("день+%.1f%%", item.Change))
+		} else if item.Change < 0 && item.Change > -3 {
+			score += 10 // падение в бычьем тренде = возможность
+			reasons = append(reasons, fmt.Sprintf("откат%.1f%%", item.Change))
+		}
+
+		// Ограничиваем score диапазоном 0-100
+		if score < 0 {
+			score = 0
+		}
+		if score > 100 {
+			score = 100
+		}
+
+		trend := "bear"
+		if item.TrendBull {
+			trend = "bull"
+		}
+
+		reasonStr := ""
+		if len(reasons) > 0 {
+			reasonStr = strings.Join(reasons, ", ")
+		}
+
+		recommendations = append(recommendations, MiyaRecommendation{
+			Ticker: item.Ticker,
+			Score:  math.Round(score*10) / 10,
+			RSI:    math.Round(item.RSI14*10) / 10,
+			Trend:  trend,
+			Reason: reasonStr,
+		})
+	}
+
+	// Сортируем рекомендации по score (убывание)
+	sort.Slice(recommendations, func(i, j int) bool {
+		return recommendations[i].Score > recommendations[j].Score
+	})
+	// Оставляем топ-5
+	if len(recommendations) > 5 {
+		recommendations = recommendations[:5]
 	}
 
 	upRatioPct := 0.0
@@ -2877,8 +2982,21 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	}
 
 	// Логируем расширенную аналитику Мии
-	a.addRuntimeEvent("info", "miya.analytics", fmt.Sprintf("tickers=%d up=%.1f%% trend_bull=%d rsi_oversold=%d rsi_overbought=%d state=%s",
-		totalCount, upRatioPct, trendBullCount, rsiOversold, rsiOverbought, state))
+	rsiAvg := 0.0
+	if rsiCount > 0 {
+		rsiAvg = rsiSum / float64(rsiCount)
+	}
+	a.addRuntimeEvent("info", "miya.analytics", fmt.Sprintf("tickers=%d up=%.1f%% trend_bull=%d rsi_avg=%.0f rsi_oversold=%d rsi_overbought=%d state=%s",
+		totalCount, upRatioPct, trendBullCount, rsiAvg, rsiOversold, rsiOverbought, state))
+
+	// Логируем топ-5 рекомендаций Мии
+	if len(recommendations) > 0 {
+		recParts := make([]string, 0, len(recommendations))
+		for _, r := range recommendations {
+			recParts = append(recParts, fmt.Sprintf("%s(%.0f,%s)", r.Ticker, r.Score, r.Trend))
+		}
+		a.addRuntimeEvent("info", "miya.recommendations", fmt.Sprintf("top5: %s", strings.Join(recParts, " ")))
+	}
 
 	sort.Slice(liquidityData, func(i, j int) bool {
 		return liquidityData[i].turnover > liquidityData[j].turnover
@@ -2901,6 +3019,9 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 		LiquidityOrder:   liquidityOrder,
 		LiquidityStatus:  "ok",
 		WatchTickers:     a.miyaInlineTickers,
+		Recommendations:  recommendations,
+		TrendBullCount:   trendBullCount,
+		RSIAverage:       math.Round(rsiAvg*10) / 10,
 	}
 
 	a.miyaOnlineSignalMu.Lock()
