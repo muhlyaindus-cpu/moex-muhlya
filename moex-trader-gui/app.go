@@ -4977,6 +4977,10 @@ func (a *App) autoLoop(ctx context.Context) {
 					if rec.Action != "buy" || rec.Score < 80 {
 						continue
 					}
+					// Проверяем denylist
+					if a.isTickerStaticallyDenied(rec.Ticker) {
+						continue
+					}
 					recKey := canonicalTickerKey(rec.Ticker)
 					// Пропускаем, если уже есть в обычных кандидатах
 					alreadyInCandidates := false
