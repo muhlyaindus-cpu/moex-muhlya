@@ -326,6 +326,9 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 						s := fmt.Sprintf("%v", statusVal)
 						item.TradingActive = (s == "T" || s == "2")
 					}
+				} else {
+					// TRADINGSTATUS отсутствует (фьючерсы FORTS) — если LAST > 0, считаем активным
+					item.TradingActive = (last > 0)
 				}
 				result = append(result, item)
 			}
