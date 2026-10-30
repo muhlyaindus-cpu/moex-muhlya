@@ -253,66 +253,80 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 		if t == "" {
 			continue
 		}
-		u := fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t)
-		resp, err := c.httpClient.Get(u)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		var parsed map[string]interface{}
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			continue
-		}
-		mdBlock, _ := parsed["marketdata"].(map[string]interface{})
-		if mdBlock == nil {
-			continue
-		}
-		cols, _ := mdBlock["columns"].([]interface{})
-		data, _ := mdBlock["data"].([]interface{})
-		if len(cols) == 0 || len(data) == 0 {
-			continue
-		}
-		lastIdx := findColumnIndex(cols, "LAST")
-		changeIdx := findColumnIndex(cols, "CHANGE")
-		valIdx := findColumnIndex(cols, "VALTODAY")
-		statusIdx := findColumnIndex(cols, "TRADINGSTATUS")
-		for _, rowAny := range data {
-			row, _ := rowAny.([]interface{})
-			if lastIdx >= len(row) {
+		// Пробуем акции TQBR, затем фьючерсы FORTS
+		found := false
+		for _, endpoint := range []string{
+			fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t),
+			fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t),
+		} {
+			resp, err := c.httpClient.Get(endpoint)
+			if err != nil {
 				continue
 			}
-			last := moexToFloat(row[lastIdx])
-			if last <= 0 {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
 				continue
 			}
-			item := MarketSnapshotItem{
-				Ticker: t,
-				Last:   last,
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				continue
 			}
-			if changeIdx >= 0 && changeIdx < len(row) {
-				item.Change = moexToFloat(row[changeIdx])
+			mdBlock, _ := parsed["marketdata"].(map[string]interface{})
+			if mdBlock == nil {
+				continue
 			}
-			if valIdx >= 0 && valIdx < len(row) {
-				item.TurnoverRub = moexToFloat(row[valIdx])
+			cols, _ := mdBlock["columns"].([]interface{})
+			data, _ := mdBlock["data"].([]interface{})
+			if len(cols) == 0 || len(data) == 0 {
+				continue
 			}
-			if statusIdx >= 0 && statusIdx < len(row) {
-				// TRADINGSTATUS может быть строкой "T" (торги идут) или числом 2
-				statusVal := row[statusIdx]
-				switch v := statusVal.(type) {
-				case string:
-					item.TradingActive = (v == "T" || v == "2")
-				case float64:
-					item.TradingActive = (v == 2)
-				default:
-					s := fmt.Sprintf("%v", statusVal)
-					item.TradingActive = (s == "T" || s == "2")
+			lastIdx := findColumnIndex(cols, "LAST")
+			if lastIdx < 0 {
+				continue
+			}
+			// Нашли данные — обрабатываем
+			changeIdx := findColumnIndex(cols, "CHANGE")
+			valIdx := findColumnIndex(cols, "VALTODAY")
+			statusIdx := findColumnIndex(cols, "TRADINGSTATUS")
+			for _, rowAny := range data {
+				row, _ := rowAny.([]interface{})
+				if lastIdx >= len(row) {
+					continue
 				}
+				last := moexToFloat(row[lastIdx])
+				if last <= 0 {
+					continue
+				}
+				item := MarketSnapshotItem{
+					Ticker: t,
+					Last:   last,
+				}
+				if changeIdx >= 0 && changeIdx < len(row) {
+					item.Change = moexToFloat(row[changeIdx])
+				}
+				if valIdx >= 0 && valIdx < len(row) {
+					item.TurnoverRub = moexToFloat(row[valIdx])
+				}
+				if statusIdx >= 0 && statusIdx < len(row) {
+					statusVal := row[statusIdx]
+					switch v := statusVal.(type) {
+					case string:
+						item.TradingActive = (v == "T" || v == "2")
+					case float64:
+						item.TradingActive = (v == 2)
+					default:
+						s := fmt.Sprintf("%v", statusVal)
+						item.TradingActive = (s == "T" || s == "2")
+					}
+				}
+				result = append(result, item)
 			}
-			result = append(result, item)
+			found = true
+			break // нашли на первом endpoint — не ищем дальше
+		}
+		if !found {
+			continue
 		}
 	}
 	return result

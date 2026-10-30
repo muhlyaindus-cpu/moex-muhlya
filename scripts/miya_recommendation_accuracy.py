@@ -5,6 +5,9 @@
 Читает miya.recommendations из runtime_events, проверяет цену через N часов,
 считает % точности. Чистит записи старше 7 дней.
 
+Формат рекомендаций (обновлён 2026-10-30):
+  top5: TATN(buy,96,bull) NLMK(buy,95,bull) ROSN(hold,85,bull)
+
 Использование:
     python scripts/miya_recommendation_accuracy.py [--hours 4] [--days 7]
 """
@@ -29,33 +32,51 @@ def run_sql(sql: str) -> str:
 
 
 def parse_recommendations(details: str) -> list:
-    """Парсит строку рекомендаций: 'top5: ALRS(97,bull) TATN(96,bull) ...'"""
-    pattern = r'(\w+)\((\d+),(bull|bear)\)'
-    matches = re.findall(pattern, details)
+    """Парсит строку рекомендаций:
+    Новый формат: 'TATN(buy,96,bull) NLMK(buy,95,bull)'
+    Старый формат: 'ALRS(97,bull) TATN(96,bull)'
+    """
+    # Новый формат с action
+    new_pattern = r'(\w+)\((buy|sell|hold),(\d+),(bull|bear)\)'
+    matches = re.findall(new_pattern, details)
+    if matches:
+        return [
+            {"ticker": m[0], "action": m[1], "score": int(m[2]), "trend": m[3]}
+            for m in matches
+        ]
+    # Старый формат без action
+    old_pattern = r'(\w+)\((\d+),(bull|bear)\)'
+    matches = re.findall(old_pattern, details)
     return [
-        {"ticker": m[0], "score": int(m[1]), "trend": m[2]}
+        {"ticker": m[0], "action": "unknown", "score": int(m[1]), "trend": m[2]}
         for m in matches
     ]
 
 
 def get_current_prices(tickers: list) -> dict:
-    """Получить текущие цены тикеров через MOEX ISS."""
+    """Получить текущие цены тикеров через MOEX ISS (акции + фьючерсы)."""
     prices = {}
     for ticker in tickers:
-        cmd = f'curl -s "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&marketdata.columns=SECID,LAST"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        try:
-            data = json.loads(result.stdout)
-            md = data.get("marketdata", {})
-            cols = md.get("columns", [])
-            rows = md.get("data", [])
-            if "LAST" in cols and rows:
-                last_idx = cols.index("LAST")
-                price = rows[0][last_idx]
-                if price:
-                    prices[ticker] = float(price)
-        except (json.JSONDecodeError, KeyError, IndexError):
-            pass
+        # Пробуем акции, затем фьючерсы
+        for endpoint in [
+            f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&marketdata.columns=SECID,LAST",
+            f"https://iss.moex.com/iss/engines/futures/markets/forts/securities/{ticker}.json?iss.meta=off&marketdata.columns=SECID,LAST",
+        ]:
+            cmd = f'curl -s "{endpoint}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            try:
+                data = json.loads(result.stdout)
+                md = data.get("marketdata", {})
+                cols = md.get("columns", [])
+                rows = md.get("data", [])
+                if "LAST" in cols and rows:
+                    last_idx = cols.index("LAST")
+                    price = rows[0][last_idx]
+                    if price:
+                        prices[ticker] = float(price)
+                        break  # нашли цену
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
     return prices
 
 
@@ -81,6 +102,9 @@ def analyze(hours: int = 4, days: int = 7):
         return
 
     total_recs = 0
+    buy_recs = 0
+    sell_recs = 0
+    hold_recs = 0
     wins = 0
     losses = 0
     pending = 0
@@ -116,33 +140,35 @@ def analyze(hours: int = 4, days: int = 7):
         for rec in recs:
             total_recs += 1
             ticker = rec["ticker"]
+            action = rec["action"]
             score = rec["score"]
             trend = rec["trend"]
 
-            # Получаем цену в момент рекомендации (примерно)
-            # и текущую цену
+            if action == "buy":
+                buy_recs += 1
+            elif action == "sell":
+                sell_recs += 1
+            else:
+                hold_recs += 1
+
             current_prices = get_current_prices([ticker])
             if ticker not in current_prices:
                 pending += 1
                 continue
 
             current_price = current_prices[ticker]
-            # Для простоты считаем: если trend=bull и цена выросла — win
-            # Если trend=bear и цена упала — win
-            # В реальности нужно знать цену в момент рекомендации
+            print(f"   {ticker}: {action} score={score} trend={trend} current={current_price:.2f}")
 
-            # Пока просто логируем
-            print(f"   {ticker}: score={score}, trend={trend}, current={current_price:.2f}")
-
-            # Упрощённая проверка: если bullish с score > 90 — ожидаем рост
-            if score > 90 and trend == "bull":
-                # Нужно сравнить с ценой в момент рекомендации
-                # Пока считаем все как pending
-                pending += 1
+            # Упрощённая проверка точности
+            if score > 90 and trend == "bull" and action == "buy":
+                pending += 1  # нужна цена в момент рекомендации для точной проверки
 
     print("\n" + "=" * 70)
     print(f"📈 Итого:")
     print(f"   Всего рекомендаций: {total_recs}")
+    print(f"   🟢 BUY: {buy_recs}")
+    print(f"   🔴 SELL: {sell_recs}")
+    print(f"   🟡 HOLD: {hold_recs}")
     print(f"   ✅ Wins: {wins}")
     print(f"   ❌ Losses: {losses}")
     print(f"   ⏳ Pending: {pending}")
@@ -157,19 +183,15 @@ def cleanup(days: int = 7):
     since = datetime.now() - timedelta(days=days)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
 
-    sql = f"DELETE FROM runtime_events WHERE step = 'miya.recommendations' AND at < '{since_str}'"
-    # Для безопасности — сначала считаем
     count_sql = f"SELECT COUNT(*) FROM runtime_events WHERE step = 'miya.recommendations' AND at < '{since_str}'"
     count = run_sql(count_sql)
     print(f"   Найдено записей для удаления: {count}")
 
     if count and int(count) > 0:
-        # Uncomment to actually delete:
-        # run_sql(sql)
         print(f"   ⚠️  Удаление закомментировано для безопасности")
         print(f"   Раскомментируйте строку run_sql(sql) в функции cleanup()")
     else:
-        print("   ✅ Нечего удалять")
+        print(f"   ✅ Нечего удалять")
 
 
 if __name__ == "__main__":
