@@ -3918,6 +3918,19 @@ func (a *App) autoLoop(ctx context.Context) {
 			// Режим PAUSE — не открываем новые позиции
 			miyaPauseMode := miyaOnlineHintsEnabled && miyaSig.TradingMode.Mode == "pause"
 
+			// Эксперимент: разделение бюджета 50/50 (свободный / принудительный по рекомендациям Мии)
+			miyaForcedBudgetPct := envFloat("AGENT_MIA_FORCED_BUDGET_PCT", 0.0)
+			if miyaForcedBudgetPct < 0 {
+				miyaForcedBudgetPct = 0
+			}
+			if miyaForcedBudgetPct > 0.90 {
+				miyaForcedBudgetPct = 0.90
+			}
+			freeBudget := autoBudgetBal * (1.0 - miyaForcedBudgetPct)
+			forcedBudget := autoBudgetBal * miyaForcedBudgetPct
+			freeBudgetUsed := 0.0
+			forcedBudgetUsed := 0.0
+
 			// Снимок портфеля, чтобы не покупать бесконечно (один запрос к брокеру на цикл).
 			portfolio := a.GetPortfolio()
 			now := time.Now()
@@ -4544,6 +4557,9 @@ func (a *App) autoLoop(ctx context.Context) {
 					// Gate reduction для buy-рекомендаций Мии
 					if recAction, ok := miyaRecActions[canonicalTickerKey(s.Ticker)]; ok && recAction == "buy" {
 						candGate -= 0.05 // снизить порог входа для рекомендованных тикеров
+						if miyaForcedBudgetPct > 0 {
+							candGate -= 0.15 // ещё сильнее для принудительного бюджета
+						}
 					}
 					expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 					roundTripCostPct := stockRoundTripCostPct
@@ -4725,6 +4741,9 @@ func (a *App) autoLoop(ctx context.Context) {
 						// Gate reduction для buy-рекомендаций Мии
 						if recAction, ok := miyaRecActions[canonicalTickerKey(s.Ticker)]; ok && recAction == "buy" {
 							candGate -= 0.05
+							if miyaForcedBudgetPct > 0 {
+								candGate -= 0.15
+							}
 						}
 						expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 						roundTripCostPct := stockRoundTripCostPct
@@ -5079,6 +5098,25 @@ func (a *App) autoLoop(ctx context.Context) {
 							),
 						)
 						buyAttempts++
+						// Определяем, принудительный ли это кандидат (из рекомендаций Мии)
+						recKey := canonicalTickerKey(cand.Ticker)
+						isForced := false
+						if recAction, ok := miyaRecActions[recKey]; ok && recAction == "buy" && miyaForcedBudgetPct > 0 {
+							isForced = true
+						}
+						// Проверяем бюджет
+						orderCost := cand.Price * float64(qty)
+						if isForced {
+							if forcedBudgetUsed+orderCost > forcedBudget {
+								// Принудительный бюджет исчерпан — пропускаем
+								continue
+							}
+						} else {
+							if freeBudgetUsed+orderCost > freeBudget {
+								// Свободный бюджет исчерпан — пропускаем
+								continue
+							}
+						}
 						buyPlaced := false
 						if cand.IsFutures {
 							buyPlaced = a.BuyFutures(cand.Ticker, qty, cand.Price)
@@ -5090,6 +5128,13 @@ func (a *App) autoLoop(ctx context.Context) {
 							placed++
 							bestBuy = cand.Ticker
 							bestBuyConf = cand.Conf
+							// Обновляем счётчики бюджета
+							if isForced {
+								forcedBudgetUsed += orderCost
+								a.addRuntimeEvent("info", "auto.forced_buy", fmt.Sprintf("%s qty=%d cost=%.0f forced_budget=%.0f/%.0f", cand.Ticker, qty, orderCost, forcedBudgetUsed, forcedBudget))
+							} else {
+								freeBudgetUsed += orderCost
+							}
 							break
 						}
 						a.addRuntimeEvent("warn", "auto.buy_candidate_failed", fmt.Sprintf("%s conf=%.2f qty=%d", cand.Ticker, cand.Conf, qty))
