@@ -3024,8 +3024,26 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	sort.Slice(recommendations, func(i, j int) bool {
 		return recommendations[i].Score > recommendations[j].Score
 	})
-	// Оставляем топ-5
+	// Оставляем топ-5, но гарантируем минимум 1 фьючерс (если score > 60)
 	if len(recommendations) > 5 {
+		// Проверяем, есть ли фьючерс в топ-5
+		hasFutures := false
+		for _, r := range recommendations[:5] {
+			if isLikelyFuturesTickerLocal(r.Ticker) {
+				hasFutures = true
+				break
+			}
+		}
+		// Если нет фьючерса — ищем лучший фьючерс и добавляем
+		if !hasFutures {
+			for _, r := range recommendations[5:] {
+				if isLikelyFuturesTickerLocal(r.Ticker) && r.Score > 60 {
+					// Заменяем последний элемент топ-5 на фьючерс
+					recommendations[4] = r
+					break
+				}
+			}
+		}
 		recommendations = recommendations[:5]
 	}
 
@@ -4974,7 +4992,15 @@ func (a *App) autoLoop(ctx context.Context) {
 			// Принудительные кандидаты из рекомендаций Мии (для эксперимента с разделением бюджета)
 			if miyaForcedBudgetPct > 0 && forcedBudget > 0 {
 				for _, rec := range miyaSig.Recommendations {
-					if rec.Action != "buy" || rec.Score < 80 {
+					if rec.Action != "buy" {
+						continue
+					}
+					// Для фьючерсов снижаем порог score (они менее ликвидны, но могут быть прибыльны)
+					minScore := 80.0
+					if isLikelyFuturesTickerLocal(rec.Ticker) {
+						minScore = 60.0
+					}
+					if rec.Score < minScore {
 						continue
 					}
 					// Проверяем denylist
