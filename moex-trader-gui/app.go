@@ -4971,6 +4971,61 @@ func (a *App) autoLoop(ctx context.Context) {
 				}
 			}
 
+			// Принудительные кандидаты из рекомендаций Мии (для эксперимента с разделением бюджета)
+			if miyaForcedBudgetPct > 0 && forcedBudget > 0 {
+				for _, rec := range miyaSig.Recommendations {
+					if rec.Action != "buy" || rec.Score < 80 {
+						continue
+					}
+					recKey := canonicalTickerKey(rec.Ticker)
+					// Пропускаем, если уже есть в обычных кандидатах
+					alreadyInCandidates := false
+					for _, bc := range buyCandidates {
+						if canonicalTickerKey(bc.Ticker) == recKey {
+							alreadyInCandidates = true
+							break
+						}
+					}
+					if alreadyInCandidates {
+						continue
+					}
+					// Получаем цену
+					price, priceErr := a.moex.GetCurrentPrice(rec.Ticker)
+					if priceErr != nil || price <= 0 {
+						continue
+					}
+					// Создаём принудительного кандидата с высоким conf
+					lot := a.moex.GetLotSize(rec.Ticker)
+					if lot < 1 {
+						lot = 1
+					}
+					forcedQty := int(forcedBudget / price / float64(lot))
+					if forcedQty <= 0 {
+						continue
+					}
+					forcedQty = forcedQty * lot // кратность лоту
+					buyCandidates = append(buyCandidates, buyCandidate{
+						Ticker:    rec.Ticker,
+						Qty:       forcedQty,
+						Conf:      0.90, // высокий conf для прохода gate
+						RankScore: 10.0 + rec.Score/100.0, // высокий rankScore для приоритета
+						ExecRatio: 1.0,
+						Price:     price,
+						IsFutures: isLikelyFuturesTickerLocal(rec.Ticker),
+						Mode:      "FORCED",
+						GateShift: -0.20, // снижение gate
+					})
+					a.addRuntimeEvent("info", "auto.forced_candidate_added", fmt.Sprintf("%s score=%.0f qty=%d price=%.2f", rec.Ticker, rec.Score, forcedQty, price))
+				}
+				// Пересортируем кандидатов
+				sort.SliceStable(buyCandidates, func(i, j int) bool {
+					if buyCandidates[i].RankScore == buyCandidates[j].RankScore {
+						return buyCandidates[i].Conf > buyCandidates[j].Conf
+					}
+					return buyCandidates[i].RankScore > buyCandidates[j].RankScore
+				})
+			}
+
 			// Приоритет №3: покупка (открытие long / закрытие short).
 			if !miyaPauseMode && placed < maxOrdersThisCycle && len(buyCandidates) > 0 {
 				// Автоотмена зависших pending ордеров (висят > 10 минут)
