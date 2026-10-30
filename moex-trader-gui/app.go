@@ -3764,12 +3764,14 @@ func (a *App) autoLoop(ctx context.Context) {
 					miyaLiqRank[k] = i + 1
 				}
 			}
-			// Рекомендации Мии: тикер → score (0-100)
+			// Рекомендации Мии: тикер → score (0-100) и action (buy/sell/hold)
 			miyaRecScores := map[string]float64{}
+			miyaRecActions := map[string]string{}
 			for _, rec := range miyaSig.Recommendations {
 				k := canonicalTickerKey(rec.Ticker)
 				if k != "" {
 					miyaRecScores[k] = rec.Score
+					miyaRecActions[k] = rec.Action
 				}
 			}
 			miyaWatchSet := map[string]struct{}{}
@@ -4438,8 +4440,22 @@ func (a *App) autoLoop(ctx context.Context) {
 				conf += profile.ConfDelta
 				// Бонус к conf за рекомендации Мии (топ-N тикеров)
 				if miyaRecConfBonus > 0 {
-					if recScore, ok := miyaRecScores[canonicalTickerKey(s.Ticker)]; ok && recScore > 0 {
-						conf += recScore / 100.0 * miyaRecConfBonus
+					recKey := canonicalTickerKey(s.Ticker)
+					if recScore, ok := miyaRecScores[recKey]; ok && recScore > 0 {
+						recAction := miyaRecActions[recKey]
+						switch recAction {
+						case "buy":
+							// Усиленный бонус для buy-рекомендаций
+							conf += recScore / 100.0 * miyaRecConfBonus * 1.5
+						case "sell":
+							// Штраф для sell-рекомендаций (не покупать)
+							conf -= 0.10
+						case "hold":
+							// Небольшой бонус
+							conf += recScore / 100.0 * miyaRecConfBonus * 0.5
+						default:
+							conf += recScore / 100.0 * miyaRecConfBonus
+						}
 					}
 				}
 				if conf < 0 {
@@ -4525,6 +4541,10 @@ func (a *App) autoLoop(ctx context.Context) {
 					// Бонус за рекомендации Мии (топ-N тикеров с высоким score)
 					recBonus := miyaRecommendationBonus(s.Ticker, miyaRecScores, miyaRecWeight)
 					candGate := buyConfGate + profile.BuyGateOffset
+					// Gate reduction для buy-рекомендаций Мии
+					if recAction, ok := miyaRecActions[canonicalTickerKey(s.Ticker)]; ok && recAction == "buy" {
+						candGate -= 0.05 // снизить порог входа для рекомендованных тикеров
+					}
 					expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 					roundTripCostPct := stockRoundTripCostPct
 					if isFuturesTicker {
@@ -4702,6 +4722,10 @@ func (a *App) autoLoop(ctx context.Context) {
 						}
 						recBonus := miyaRecommendationBonus(s.Ticker, miyaRecScores, miyaRecWeight)
 						candGate := buyConfGate + profile.BuyGateOffset
+						// Gate reduction для buy-рекомендаций Мии
+						if recAction, ok := miyaRecActions[canonicalTickerKey(s.Ticker)]; ok && recAction == "buy" {
+							candGate -= 0.05
+						}
 						expectedEdge := clampFloat(conf-candGate, -0.25, 0.45)
 						roundTripCostPct := stockRoundTripCostPct
 						if isFuturesTicker {
@@ -5040,12 +5064,18 @@ func (a *App) autoLoop(ctx context.Context) {
 						if i > 0 {
 							a.addRuntimeEvent("info", "auto.buy_fallback_candidate", fmt.Sprintf("using #%d %s conf=%.2f", i+1, cand.Ticker, cand.Conf))
 						}
+						// Информация о рекомендации Мии для этого тикера
+						miyaRecStr := "-"
+						if recAction, ok := miyaRecActions[canonicalTickerKey(cand.Ticker)]; ok {
+							recScore := miyaRecScores[canonicalTickerKey(cand.Ticker)]
+							miyaRecStr = fmt.Sprintf("%s(%.0f)", recAction, recScore)
+						}
 						a.addRuntimeEvent(
 							"info",
 							"auto.order_buy_try",
 							fmt.Sprintf(
-								"%s qty=%d conf=%.2f gate=%.2f mode=%s price=%.2f phase=%s miya_state=%s miya_buy_adj=%.3f",
-								cand.Ticker, qty, cand.Conf, candGate, cand.Mode, cand.Price, phase, miyaSig.State, miyaBuyGateAdjust,
+								"%s qty=%d conf=%.2f gate=%.2f mode=%s price=%.2f phase=%s miya_state=%s miya_buy_adj=%.3f miya_rec=%s",
+								cand.Ticker, qty, cand.Conf, candGate, cand.Mode, cand.Price, phase, miyaSig.State, miyaBuyGateAdjust, miyaRecStr,
 							),
 						)
 						buyAttempts++
