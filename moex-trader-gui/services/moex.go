@@ -235,6 +235,7 @@ func (c *MOEXClient) GetCurrentPrice(ticker string) (float64, error) {
 // MarketSnapshotItem — снимок рыночных данных для одного тикера (для inline MIYA).
 type MarketSnapshotItem struct {
 	Ticker        string
+	RawTicker     string  // оригинальный тикер до нормализации (для фьючерсов: SiZ6)
 	Last          float64
 	Change        float64
 	TurnoverRub   float64
@@ -253,11 +254,16 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 		if t == "" {
 			continue
 		}
-		// Пробуем акции TQBR, затем фьючерсы FORTS
+		// Для фьючерсов: убираем @RTSX но сохраняем оригинальный регистр (SiZ6, не SIZ6)
+		futuresTicker := ticker
+		if i := strings.Index(futuresTicker, "@"); i > 0 {
+			futuresTicker = futuresTicker[:i]
+		}
+		// Пробуем акции TQBR, затем фьючерсы FORTS (с оригинальным регистром)
 		found := false
 		for _, endpoint := range []string{
 			fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t),
-			fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, t),
+			fmt.Sprintf("%s/engines/futures/markets/forts/securities/%s.json?iss.meta=off&marketdata.columns=SECID,LAST,CHANGE,VALTODAY,TRADINGSTATUS", c.baseURL, futuresTicker),
 		} {
 			resp, err := c.httpClient.Get(endpoint)
 			if err != nil {
@@ -299,8 +305,9 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 					continue
 				}
 				item := MarketSnapshotItem{
-					Ticker: t,
-					Last:   last,
+					Ticker:    t,
+					RawTicker: futuresTicker,
+					Last:      last,
 				}
 				if changeIdx >= 0 && changeIdx < len(row) {
 					item.Change = moexToFloat(row[changeIdx])
@@ -337,7 +344,12 @@ func (c *MOEXClient) GetMarketSnapshot(tickers []string) []MarketSnapshotItem {
 func (c *MOEXClient) EnrichWithAnalytics(items []MarketSnapshotItem) {
 	for i := range items {
 		// Загружаем 55 дневных свечей (нужно 50 для SMA50 + запас)
-		closes, err := c.GetClosePrices(items[i].Ticker, 55)
+		// Для фьючерсов используем RawTicker (оригинальный регистр: SiZ6)
+		tickerForCandles := items[i].RawTicker
+		if tickerForCandles == "" {
+			tickerForCandles = items[i].Ticker
+		}
+		closes, err := c.GetClosePrices(tickerForCandles, 55)
 		if err != nil || len(closes) < 20 {
 			continue
 		}
