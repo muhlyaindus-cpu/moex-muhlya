@@ -2392,28 +2392,42 @@ func inTimeRange(now time.Time, fromHour, fromMin, toHour, toMin int) bool {
 }
 
 func isLikelyFuturesTickerLocal(ticker string) bool {
-	// Фьючерсы MOEX имеют формат: 2-4 буквы + 2 цифры (месяц и год)
+	// Фьючерсы MOEX имеют формат: 2-4 буквы + буква месяца (F,G,H,J,K,M,N,Q,U,V,X,Z) + цифра года
 	// Например: MTZ6, SiZ6, BRX6, GZM6
 	// Акции с цифрами: OZON, X5, YNDX — НЕ фьючерсы!
-	
+
 	ticker = strings.ToUpper(strings.TrimSpace(ticker))
-	
+
 	// Если тикер содержит @ — проверяем суффикс
 	if strings.Contains(ticker, "@") {
 		return strings.HasSuffix(ticker, "@FUT") || strings.HasSuffix(ticker, "@RTSX")
 	}
-	
-	// Проверяем формат: 2-4 буквы + 2 цифры
+
+	// Проверяем формат: 2-4 буквы + буква месяца + цифра года
 	if len(ticker) < 4 || len(ticker) > 6 {
 		return false
 	}
-	
-	// Последние 2 символа должны быть цифрами
-	lastTwo := ticker[len(ticker)-2:]
-	if lastTwo[0] < '0' || lastTwo[0] > '9' || lastTwo[1] < '0' || lastTwo[1] > '9' {
+
+	// Последний символ должен быть цифрой (год)
+	lastChar := ticker[len(ticker)-1]
+	if lastChar < '0' || lastChar > '9' {
 		return false
 	}
-	
+
+	// Предпоследний символ должен быть буквой месяца (F,G,H,J,K,M,N,Q,U,V,X,Z)
+	monthLetter := ticker[len(ticker)-2]
+	validMonthLetters := "FGHJKMNQUVXZ"
+	isMonthLetter := false
+	for _, ml := range validMonthLetters {
+		if byte(ml) == monthLetter {
+			isMonthLetter = true
+			break
+		}
+	}
+	if !isMonthLetter {
+		return false
+	}
+
 	// Первые символы должны быть буквами
 	for i := 0; i < len(ticker)-2; i++ {
 		c := ticker[i]
