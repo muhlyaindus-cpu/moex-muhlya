@@ -77,7 +77,9 @@ python .\trading-lab\validate_policy.py --data .\trading-lab\data\SBER_1d.csv --
 - Делаем сначала **paper** и только потом очень ограниченный live.
 
 ### Операционный статус лаборатории
-- Для понятного режима использования см. `LAB_FILE_MATRIX.md` (что используем всегда, что по задаче).
+- Для понятного режима использования см. [`docs/LAB_FILE_MATRIX.md`](../docs/LAB_FILE_MATRIX.md) (что используем всегда, что по задаче).
+- План развития RL-агента: [`docs/RL_PLAN.md`](../docs/RL_PLAN.md).
+- План развития Мии: [`docs/MIYA_EVOLUTION_PLAN.md`](../docs/MIYA_EVOLUTION_PLAN.md).
 - Базовый ежедневный режим лаборатории: `moex_iss_download.py` -> `validate_policy.py` -> артефакты (`validation_report.json`, `validation.passed`).
 - `train_ppo.py` и `env.py` включаем только под отдельную гипотезу обучения.
 
