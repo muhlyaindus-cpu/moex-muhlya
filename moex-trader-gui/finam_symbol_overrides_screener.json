@@ -1,4 +1,4 @@
-{
+﻿{
   "92F7": "92F7@RTSX",
   "92V6": "92V6@RTSX",
   "92X6": "92X6@RTSX",
@@ -382,7 +382,7 @@
   "NGZ6": "NGZ6@RTSX",
   "NICKEL": "NCZ6@RTSX",
   "NIKK": "N2Z6@RTSX",
-  "NLMK": "NMZ6@RTSX",
+  "NLMK": "NLMK@MISX",
   "NMH7": "NMH7@RTSX",
   "NMZ6": "NMZ6@RTSX",
   "NOH7": "NOH7@RTSX",
@@ -579,7 +579,7 @@
   "SuX6": "SUGAR-11.26@FUT",
   "SuZ6": "SUGAR-12.26@FUT",
   "T": "T-3.27@FUT",
-  "TATN": "TATN-3.27@FUT",
+  "TATN": "TATN@MISX",
   "TATP": "TATP-3.27@FUT",
   "TBH7": "T-3.27@FUT",
   "TBZ6": "T-12.26@FUT",
@@ -684,6 +684,6 @@
   "ZCH7": "ZINC-3.27@FUT",
   "ZCZ6": "ZINC-12.26@FUT",
   "ZINC": "ZINC-3.27@FUT",
-  "_comment": "Автообновлено 2026-10-27 20:50:16. Ключ — MOEX SECID или базовый тикер, значение — Finam API символ (@FUT).",
+  "_comment": "РђРІС‚РѕРѕР±РЅРѕРІР»РµРЅРѕ 2026-10-27 20:50:16. РљР»СЋС‡ вЂ” MOEX SECID РёР»Рё Р±Р°Р·РѕРІС‹Р№ С‚РёРєРµСЂ, Р·РЅР°С‡РµРЅРёРµ вЂ” Finam API СЃРёРјРІРѕР» (@FUT).",
   "_source": "MOEX ISS FORTS + Finam screener"
 }
