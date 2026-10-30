@@ -220,8 +220,14 @@ func (c *MOEXClient) getDecimalsFromPath(path string, primaryBoard string, altBo
 }
 
 func (c *MOEXClient) GetCurrentPrice(ticker string) (float64, error) {
-	// Сначала пробуем акции, затем фьючерсы.
+	// Сначала пробуем основную доску TQBR (акции), затем общий запрос, затем фьючерсы
 	price, err := c.getCurrentPriceFromPath(
+		fmt.Sprintf("%s/engines/stock/markets/shares/boards/TQBR/securities/%s.json", c.baseURL, ticker),
+	)
+	if err == nil && price > 0 {
+		return price, nil
+	}
+	price, err = c.getCurrentPriceFromPath(
 		fmt.Sprintf("%s/engines/stock/markets/shares/securities/%s.json", c.baseURL, ticker),
 	)
 	if err == nil && price > 0 {
