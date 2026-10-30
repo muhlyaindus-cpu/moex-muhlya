@@ -275,6 +275,7 @@ type MiyaRecommendation struct {
 	Score  float64 `json:"score"`  // 0-100, выше = лучше
 	RSI    float64 `json:"rsi"`    // RSI(14)
 	Trend  string  `json:"trend"`  // "bull" или "bear"
+	Action string  `json:"action"` // "buy", "sell" или "hold"
 	Reason string  `json:"reason"` // краткое объяснение
 }
 
@@ -2992,6 +2993,18 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 			trend = "bull"
 		}
 
+		// Определяем действие: buy/sell/hold
+		action := "hold"
+		if item.RSI14 > 0 && item.RSI14 < 50 && item.TrendBull {
+			action = "buy" // RSI не перекуплен + бычий тренд = покупка
+		} else if item.RSI14 > 70 {
+			action = "sell" // перекуплен = продажа
+		} else if !item.TrendBull && item.Change > 1.0 {
+			action = "sell" // медвежий тренд + рост = продажа на откате
+		} else if score >= 85 && item.TrendBull {
+			action = "buy" // высокий score + бычий тренд = покупка
+		}
+
 		reasonStr := ""
 		if len(reasons) > 0 {
 			reasonStr = strings.Join(reasons, ", ")
@@ -3002,6 +3015,7 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 			Score:  math.Round(score*10) / 10,
 			RSI:    math.Round(item.RSI14*10) / 10,
 			Trend:  trend,
+			Action: action,
 			Reason: reasonStr,
 		})
 	}
@@ -3060,7 +3074,7 @@ func (a *App) fetchMiyaInlineFromMOEX() {
 	if len(recommendations) > 0 {
 		recParts := make([]string, 0, len(recommendations))
 		for _, r := range recommendations {
-			recParts = append(recParts, fmt.Sprintf("%s(%.0f,%s)", r.Ticker, r.Score, r.Trend))
+			recParts = append(recParts, fmt.Sprintf("%s(%s,%.0f,%s)", r.Ticker, r.Action, r.Score, r.Trend))
 		}
 		a.addRuntimeEvent("info", "miya.recommendations", fmt.Sprintf("top5: %s", strings.Join(recParts, " ")))
 	}
